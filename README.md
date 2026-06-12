@@ -26,6 +26,22 @@ cd worldcup-2026-agent
 ./install.sh
 ```
 
+## 维护者发布到 GitHub
+
+如果你是在本地首次发布这个项目，先登录 GitHub CLI：
+
+```bash
+gh auth login
+```
+
+然后在项目目录执行：
+
+```bash
+gh repo create worldcup-2026-agent --public --source=. --remote=origin --push
+```
+
+发布成功后，把上方“一键安装”里的 `<your-name>` 改成你的 GitHub 用户名或组织名。
+
 安装后编辑 `.env`：
 
 ```bash
