@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+logs/
+*.log
+.DS_Store
+docs/worldcup-2026-agent-report.html
