@@ -35,6 +35,6 @@ HTML 必须包含：
 <section id="sources">来源</section>
 ```
 
-每次完成分析并生成 HTML 报告后，只把 HTML 报告地址同步发送到 Telegram 机器人当前绑定的聊天，不发送 HTML 全文。
+每次完成分析并生成 HTML 报告后，生成 2x 高清 PNG 截图，并通过 Telegram `sendDocument` 上传 PNG 原图到机器人当前绑定的聊天，不发送 HTML 全文，也不发送 HTML 地址。避免使用 `sendPhoto`，因为 Telegram 会压缩长图导致文字不清晰。
 
 所有概率都必须标注为模型主观预测，不是保证命中或官方赔率。涉及购彩时必须提醒控制预算、少串关、不要把预测当确定收益。

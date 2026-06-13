@@ -424,7 +424,7 @@ def render_report_screenshot(report_path: Path, screenshot_path: Path) -> bool:
     screenshot_path.parent.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
-        page = browser.new_page(viewport={"width": 1280, "height": 1600}, device_scale_factor=1)
+        page = browser.new_page(viewport={"width": 1800, "height": 2200}, device_scale_factor=2)
         page.goto(report_path.resolve().as_uri(), wait_until="networkidle")
         page.screenshot(path=str(screenshot_path), full_page=True)
         browser.close()
@@ -468,7 +468,7 @@ def send_telegram_screenshot(env: Dict[str, str], screenshot_path: Path, generat
     caption = (
         "世界杯每日预测更新\n"
         f"生成时间：{generated_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        "完整报告截图见图片。"
+        "完整高清报告截图见附件。"
     )
     payload, boundary = multipart_body(
         {
@@ -476,10 +476,10 @@ def send_telegram_screenshot(env: Dict[str, str], screenshot_path: Path, generat
             "caption": caption,
             "disable_web_page_preview": "true",
         },
-        "photo",
+        "document",
         screenshot_path,
     )
-    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
 
     def post(opener: request.OpenerDirector) -> None:
         req = request.Request(

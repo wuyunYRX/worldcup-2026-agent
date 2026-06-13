@@ -14,8 +14,8 @@
   - EV = 模型概率 × 赔率 - 1
   - 保本赔率 = 1 / 模型概率
   - 正期望/接近正期望候选项
-- 生成完整 HTML 报告和报告截图
-- 可选同步 Telegram，发送报告截图
+- 生成完整 HTML 报告和 2x 高清报告截图
+- 可选同步 Telegram，以文件形式发送高清 PNG 原图
 - 可用 cron 或 macOS launchd 设置每天 09:00、18:00 自动更新
 
 ## 一键安装
@@ -69,7 +69,7 @@ docs/worldcup-2026-agent-report.png
 
 ## Telegram 配置
 
-如果要把报告截图同步到 Telegram，在 `.env` 中填入：
+如果要把高清报告截图同步到 Telegram，在 `.env` 中填入：
 
 ```env
 TELEGRAM_BOT_TOKEN=你的机器人token
@@ -77,7 +77,7 @@ TELEGRAM_CHAT_ID=8563592562
 SEND_TELEGRAM=1
 ```
 
-注意：Telegram 不再发送 HTML 地址或完整 HTML 表格，本项目默认发送报告截图。
+注意：Telegram 不再发送 HTML 地址或完整 HTML 表格，本项目默认用 `sendDocument` 发送高清 PNG 原图，避免 `sendPhoto` 压缩导致长图发糊。
 
 ## 定时运行
 
