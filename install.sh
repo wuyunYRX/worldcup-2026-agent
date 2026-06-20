@@ -12,14 +12,14 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip >/dev/null
+.venv/Scripts/python.exe -m pip install --upgrade pip >/dev/null
 
 if [ -s requirements.txt ]; then
-  .venv/bin/python -m pip install -r requirements.txt
+  .venv/Scripts/python.exe -m pip install -r requirements.txt
 fi
 
-if .venv/bin/python -c "import playwright" >/dev/null 2>&1; then
-  .venv/bin/python -m playwright install chromium
+if .venv/Scripts/python.exe -c "import playwright" >/dev/null 2>&1; then
+  .venv/Scripts/python.exe -m playwright install chromium
 fi
 
 mkdir -p docs logs launchd

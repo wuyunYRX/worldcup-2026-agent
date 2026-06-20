@@ -25,6 +25,26 @@ DEFAULT_ODDS_URL = "https://cp.zgzcw.com/lottery/jchtplayvsForJsp.action?lottery
 OUTCOME_NAMES = ["主胜", "平", "客胜"]
 
 
+def normalize_text(value: str) -> str:
+    text = html.unescape(value).strip()
+    return re.sub(r"[\uE000-\uF8FF\uFFFD]", "", text).strip()
+
+
+def decode_page_bytes(data: bytes) -> str:
+    for enc, errors in (("utf-8", "strict"), ("gb18030", "ignore"), ("gbk", "ignore")):
+        try:
+            text = data.decode(enc, errors=errors)
+        except UnicodeDecodeError:
+            continue
+        if any(token in text for token in ("比赛时间", "spArr", 'class="beginBet')):
+            return text
+        normalized = normalize_text(text)
+        if any(token in normalized for token in ("比赛时间", "世界杯", 'class="beginBet')):
+            return normalized
+        return text
+    return data.decode("utf-8", errors="ignore")
+
+
 def load_env(path: Path) -> Dict[str, str]:
     env: Dict[str, str] = {}
     if path.exists():
@@ -47,12 +67,7 @@ def fetch_text(url: str, timeout: int = 25) -> str:
     )
     with request.urlopen(req, timeout=timeout) as resp:
         data = resp.read()
-    for enc in ("utf-8", "gb18030", "gbk"):
-        try:
-            return data.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="ignore")
+    return decode_page_bytes(data)
 
 
 def load_model(path: Path) -> Dict[Tuple[str, str], Tuple[float, float, float]]:
@@ -70,7 +85,7 @@ def load_model(path: Path) -> Dict[Tuple[str, str], Tuple[float, float, float]]:
 
 
 def parse_attrs(tag: str) -> Dict[str, str]:
-    return {k.lower(): html.unescape(v) for k, v in re.findall(r'(\w+)="([^"]*)"', tag)}
+    return {k.lower(): normalize_text(v) for k, v in re.findall(r'(\w+)="([^"]*)"', tag)}
 
 
 def parse_float_triplet(part: str) -> List[float]:
@@ -145,28 +160,96 @@ def score_text(prediction: dict) -> str:
     return " / ".join(f"{home}-{away} ({pct(prob, 1)})" for home, away, prob in prediction["top_scores"])
 
 
+def simplify_team_name(name: str) -> str:
+    return re.sub(r"[^\u4e00-\u9fffA-Za-z]", "", normalize_text(name))
+
+
+def common_prefix_len(a: str, b: str) -> int:
+    count = 0
+    for left, right in zip(a, b):
+        if left != right:
+            break
+        count += 1
+    return count
+
+
+def build_team_aliases(model: Dict[Tuple[str, str], Tuple[float, float, float]]) -> Dict[str, str]:
+    teams = sorted({team for pair in model for team in pair})
+    aliases: Dict[str, str] = {}
+    for team in teams:
+        aliases[simplify_team_name(team)] = team
+    return aliases
+
+
+def resolve_team_name(name: str, aliases: Dict[str, str]) -> str:
+    simplified = simplify_team_name(name)
+    if not simplified:
+        return name
+    exact = aliases.get(simplified)
+    if exact:
+        return exact
+
+    best_name = name
+    best_score = 0
+    for alias_key, canonical in aliases.items():
+        score = max(common_prefix_len(simplified, alias_key), common_prefix_len(alias_key, simplified))
+        if score > best_score:
+            best_score = score
+            best_name = canonical
+    if best_score >= 2:
+        return best_name
+    return name
+
+
+def infer_team_strengths(model: Dict[Tuple[str, str], Tuple[float, float, float]]) -> Dict[str, float]:
+    strengths: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    for (home, away), (home_win, _draw, away_win) in model.items():
+        edge = home_win - away_win
+        strengths[home] = strengths.get(home, 0.0) + edge
+        strengths[away] = strengths.get(away, 0.0) - edge
+        counts[home] = counts.get(home, 0) + 1
+        counts[away] = counts.get(away, 0) + 1
+    for team, total in list(strengths.items()):
+        strengths[team] = total / max(counts.get(team, 1), 1)
+    return strengths
+
+
+def estimate_match_probabilities(home: str, away: str, strengths: Dict[str, float]) -> Optional[Tuple[float, float, float]]:
+    if home not in strengths or away not in strengths:
+        return None
+
+    delta = strengths[home] - strengths[away] + 0.08
+    draw = max(0.18, min(0.30, 0.26 - abs(delta) * 0.12))
+    remaining = 1.0 - draw
+    home_share = 1.0 / (1.0 + math.exp(-delta * 3.2))
+    home_win = remaining * home_share
+    away_win = remaining - home_win
+    return (home_win, draw, away_win)
+
+
 def parse_odds_page(page: str, model: Dict[Tuple[str, str], Tuple[float, float, float]]) -> List[dict]:
-    blocks = re.findall(r'(<tr\b(?=[^>]*\bm="世界杯")[\s\S]*?</tr>)', page, flags=re.I)
+    aliases = build_team_aliases(model)
+    strengths = infer_team_strengths(model)
+    blocks = re.findall(r'(<tr\b(?=[^>]*\bm="[^"]+")[\s\S]*?</tr>)', page, flags=re.I)
     rows: List[dict] = []
     for block in blocks:
         tag = block.split(">", 1)[0]
         attrs = parse_attrs(tag)
-        titles = [
-            html.unescape(x)
-            for x in re.findall(r'<a[^>]+title="([^"]+)"[^>]*>', block)
-            if x != "世界杯"
-        ]
+        titles = [normalize_text(x) for x in re.findall(r'<a[^>]+title="([^"]+)"[^>]*>', block)]
         if len(titles) < 2:
             continue
-        home, away = titles[:2]
+        raw_home, raw_away = titles[-2:]
+        home = resolve_team_name(raw_home, aliases)
+        away = resolve_team_name(raw_away, aliases)
         probs = model.get((home, away))
-        if not probs:
-            continue
+        if probs is None:
+            probs = estimate_match_probabilities(home, away, strengths)
 
         match_time = ""
         match_time_match = re.search(r'title="比赛时间:([^"]+)"', block)
         if match_time_match:
-            match_time = html.unescape(match_time_match.group(1))
+            match_time = normalize_text(match_time_match.group(1))
 
         sp_arr_match = re.search(r'class="spArr"[\s\S]*?value="([^"]*)"', block)
         sp_value = html.unescape(sp_arr_match.group(1)) if sp_arr_match else ""
@@ -174,7 +257,7 @@ def parse_odds_page(page: str, model: Dict[Tuple[str, str], Tuple[float, float, 
         normal_odds = parse_float_triplet(parts[0]) if parts else [0.0, 0.0, 0.0]
         handicap_odds = parse_float_triplet(parts[1]) if len(parts) > 1 else [0.0, 0.0, 0.0]
         ev = [
-            probs[i] * normal_odds[i] - 1 if normal_odds[i] > 0 else None
+            probs[i] * normal_odds[i] - 1 if probs and normal_odds[i] > 0 else None
             for i in range(3)
         ]
 
@@ -191,10 +274,22 @@ def parse_odds_page(page: str, model: Dict[Tuple[str, str], Tuple[float, float, 
                 "normal_odds": normal_odds,
                 "handicap_odds": handicap_odds,
                 "ev": ev,
-                "score_prediction": score_prediction_from_wdl(probs),
+                "score_prediction": score_prediction_from_wdl(probs) if probs else None,
             }
         )
     return sorted(rows, key=lambda r: (r["match_time"], r["num"]))
+
+
+def probability_text(probabilities: Optional[Tuple[float, float, float]]) -> str:
+    if not probabilities:
+        return "待补模型"
+    return " / ".join(pct(x) for x in probabilities)
+
+
+def score_prediction_text(prediction: Optional[dict]) -> str:
+    if not prediction:
+        return "待补模型"
+    return score_text(prediction)
 
 
 def pct(value: float, digits: int = 0) -> str:
@@ -227,6 +322,10 @@ def ev_class(value: Optional[float]) -> str:
 def best_ev_remark(row: dict) -> str:
     ev = row["ev"]
     odds = row["normal_odds"]
+    if not row["probabilities"]:
+        if all(x <= 0 for x in odds):
+            return f"已抓到实时赛程；普通胜平负未开，当前让球 {row['handicap']}，让球赔率 {odds_text(row['handicap_odds'])}。"
+        return "已抓到实时赔率，但当前模型未覆盖此对阵，暂不计算 EV。"
     if all(x <= 0 for x in odds):
         return f"普通胜平负未开；当前让球 {row['handicap']}，让球赔率 {odds_text(row['handicap_odds'])}。"
     best_idx = max(range(3), key=lambda i: ev[i] if ev[i] is not None else -999)
@@ -301,15 +400,15 @@ def ticket_metrics(picks: List[Tuple[dict, int]], stake_per_pick: float = 2.0) -
 def row_html(row: dict) -> str:
     probs = row["probabilities"]
     evs = row["ev"]
-    probability_text = " / ".join(pct(x) for x in probs)
+    probability_cell = probability_text(probs)
     ev_cells = " / ".join(f'<span class="{ev_class(x)}">{ev_text(x)}</span>' for x in evs)
     return (
         "<tr>"
         f"<td>{html.escape(row['num'])}</td>"
         f"<td>{html.escape(row['match_time'])}</td>"
         f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
-        f"<td>{probability_text}</td>"
-        f"<td>{html.escape(score_text(row['score_prediction']))}</td>"
+        f"<td>{html.escape(probability_cell)}</td>"
+        f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
         f"<td>{html.escape(odds_text(row['normal_odds']))}</td>"
         f"<td>{ev_cells}</td>"
         f"<td>{html.escape(best_ev_remark(row))}</td>"
@@ -321,14 +420,15 @@ def generate_report(rows: List[dict], odds_url: str, generated_at: dt.datetime) 
     candidates = select_candidates(rows)
     picks = select_ticket(rows)
     stake, expected_return, roi, profit_probability = ticket_metrics(picks)
+    modeled_rows = [row for row in rows if row["probabilities"]]
 
     focus = rows[:2]
     focus_rows = "\n".join(
         "<tr>"
         f"<td>{html.escape(row['match_time'])}</td>"
         f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
-        f"<td>{' / '.join(pct(x) for x in row['probabilities'])}</td>"
-        f"<td>{html.escape(score_text(row['score_prediction']))}</td>"
+        f"<td>{html.escape(probability_text(row['probabilities']))}</td>"
+        f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
         f"<td>{html.escape(odds_text(row['normal_odds']))}</td>"
         f"<td>{html.escape(best_ev_remark(row))}</td>"
         "</tr>"
@@ -399,7 +499,7 @@ th {{ background: #eef3f8; text-align: left; }}
 
 <section id="summary">
 <h2>本轮摘要</h2>
-<p>当前抓取到可售且模型覆盖的世界杯场次 {len(rows)} 场。普通胜平负未开场次：{html.escape(no_normal_text)}。</p>
+<p>当前抓取到可售世界杯场次 {len(rows)} 场，其中模型已覆盖 {len(modeled_rows)} 场。普通胜平负未开场次：{html.escape(no_normal_text)}。</p>
 </section>
 
 <section id="matches-24h">
@@ -420,7 +520,7 @@ th {{ background: #eef3f8; text-align: left; }}
 </section>
 
 <section id="remaining-probabilities">
-<h2>当前剩余可售世界杯场次模型胜平负概率</h2>
+<h2>当前剩余可售世界杯场次</h2>
 <table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>模型胜平负概率（主胜/平/客胜）</th><th>最可能比分</th><th>当前不让球赔率（主胜/平/客胜）</th><th>EV（主胜/平/客胜）</th><th>备注</th></tr></thead><tbody>
 {''.join(row_html(row) for row in rows)}
 </tbody></table>
@@ -570,6 +670,13 @@ def send_telegram_screenshot(env: Dict[str, str], screenshot_path: Path, generat
             print(f"First attempt was: {type(first_error).__name__}: {first_error}", file=sys.stderr)
 
 
+def resolve_report_url(report_path: Path, env: Dict[str, str]) -> str:
+    configured = env.get("REPORT_URL", "").strip()
+    if not configured or "absolute/path/to" in configured:
+        return report_path.resolve().as_uri()
+    return configured
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default=".env", help="Path to .env file")
@@ -580,17 +687,17 @@ def main() -> int:
     odds_url = env.get("ODDS_URL", DEFAULT_ODDS_URL)
     report_path = ROOT / env.get("REPORT_PATH", "docs/worldcup-2026-agent-report.html")
     screenshot_path = ROOT / env.get("REPORT_SCREENSHOT_PATH", "docs/worldcup-2026-agent-report.png")
-    report_url = env.get("REPORT_URL") or report_path.resolve().as_uri()
+    report_url = resolve_report_url(report_path, env)
 
     model = load_model(ROOT / "config" / "model_probabilities.json")
     if args.odds_html:
-        page = Path(args.odds_html).read_text(encoding="utf-8", errors="ignore")
+        page = decode_page_bytes(Path(args.odds_html).read_bytes())
     else:
         page = fetch_text(odds_url)
 
     rows = parse_odds_page(page, model)
     if not rows:
-        print("No model-covered World Cup odds rows were parsed.", file=sys.stderr)
+        print("No World Cup odds rows were parsed.", file=sys.stderr)
 
     generated_at = dt.datetime.now()
     report = generate_report(rows, odds_url, generated_at)
