@@ -13,14 +13,28 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from ai_probability_adjustment import adjust_probabilities_with_ai_context  # noqa: E402
 from kelly_criterion import fractional_kelly, kelly_fraction, kelly_stake  # noqa: E402
 from probability_fusion import fuse_wdl_probabilities, normalize_triplet  # noqa: E402
-from review_completed_matches import brier, logloss, market_probs_from_odds, top1_hit, top3_hit  # noqa: E402
+from review_completed_matches import (  # noqa: E402
+    brier,
+    logloss,
+    market_probs_from_odds,
+    score_diagnosis,
+    score_metric_summary,
+    top1_hit,
+    top3_hit,
+)
 from worldcup_agent import (  # noqa: E402
+    asian_handicap_probabilities_from_score_grid,
+    asian_handicap_return_units,
+    asian_handicap_value_metrics,
     apply_value_metrics,
     build_group_standings,
     build_team_aliases,
     calibrate_wdl_probabilities,
     filter_nearby_rows,
+    handicap_probabilities_from_score_prediction,
     merge_candidate_rows,
+    parse_asian_handicap_source,
+    parse_zgzcw_ypdb_market,
     prioritize_primary_rows,
     result_pick_text,
     resolve_team_name,
@@ -87,6 +101,24 @@ class CoreMathTests(unittest.TestCase):
         self.assertTrue(top1_hit(prediction, 1, 0))
         self.assertTrue(top3_hit(prediction, 2, 1))
 
+    def test_score_diagnosis_flags_total_goals_and_big_win(self):
+        prediction = {
+            "score_grid": [
+                (1, 0, 0.35),
+                (2, 0, 0.25),
+                (1, 1, 0.20),
+                (0, 0, 0.20),
+            ],
+            "top_scores": [(1, 0, 0.35), (2, 0, 0.25), (1, 1, 0.20)],
+        }
+        diagnosis = score_diagnosis(prediction, 4, 0, (0.65, 0.22, 0.13))
+        self.assertIn("underestimated_total_goals", diagnosis["score_diagnosis"])
+        self.assertIn("underestimated_big_win", diagnosis["score_diagnosis"])
+        self.assertIn("score_distribution_too_narrow", diagnosis["score_diagnosis"])
+        summary = score_metric_summary([{**diagnosis, "top3_hit": False}], exact_hits=0, top3_hits=0)
+        self.assertEqual(summary["top3_hit_rate"], 0.0)
+        self.assertGreater(summary["underestimated_total_goals_rate"], 0.0)
+
 
 class ReportFlowTests(unittest.TestCase):
     def test_calibration_and_one_day_window(self):
@@ -104,6 +136,78 @@ class ReportFlowTests(unittest.TestCase):
     def test_result_pick_uses_highest_fused_probability(self):
         row = {"probabilities": (0.40, 0.25, 0.35), "fused_probabilities": (0.38, 0.24, 0.38)}
         self.assertTrue(result_pick_text(row).startswith("主胜"))
+
+    def test_handicap_probabilities_from_score_prediction(self):
+        prediction = {"score_grid": [(2, 0, 0.4), (1, 0, 0.2), (1, 1, 0.2), (0, 1, 0.2)]}
+        probs = handicap_probabilities_from_score_prediction(prediction, -1.0)
+        self.assertIsNotNone(probs)
+        self.assertAlmostEqual(probs[0], 0.4)
+        self.assertAlmostEqual(probs[1], 0.2)
+        self.assertAlmostEqual(probs[2], 0.4)
+
+    def test_asian_handicap_quarter_line_settlement(self):
+        self.assertEqual(asian_handicap_return_units(1, 0, -0.75), 0.5)
+        self.assertEqual(asian_handicap_return_units(2, 0, -0.75), 1.0)
+        self.assertEqual(asian_handicap_return_units(0, 0, -0.25), -0.5)
+        self.assertEqual(asian_handicap_return_units(1, 1, 0.25), 0.5)
+
+    def test_asian_handicap_probabilities_and_value_metrics(self):
+        grid = [(2, 0, 0.4), (1, 0, 0.2), (1, 1, 0.2), (0, 1, 0.2)]
+        probs = asian_handicap_probabilities_from_score_grid(grid, -0.75)
+        self.assertIsNotNone(probs)
+        self.assertAlmostEqual(probs["home_full_win"], 0.4)
+        self.assertAlmostEqual(probs["home_half_win"], 0.2)
+        self.assertAlmostEqual(probs["home_full_loss"], 0.4)
+        asian_probs, market_probs, ev, kelly = asian_handicap_value_metrics(
+            grid,
+            -0.75,
+            [1.90, 1.95],
+            {"kelly_fraction": 0.25, "min_edge": 0.01},
+        )
+        self.assertIsNotNone(asian_probs)
+        self.assertAlmostEqual(sum(market_probs), 1.0)
+        self.assertEqual(len(ev), 2)
+        self.assertEqual(len(kelly), 2)
+
+    def test_parse_asian_handicap_json_source(self):
+        aliases = build_team_aliases({("西班牙", "沙特阿拉伯"): (0.6, 0.2, 0.2)})
+        text = json.dumps(
+            {
+                "markets": [
+                    {
+                        "match_time": "2026-06-22 03:00",
+                        "home": "西班牙",
+                        "away": "沙特",
+                        "line": "-1.25",
+                        "home_odds": 1.92,
+                        "away_odds": 1.98,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        markets = parse_asian_handicap_source(text, aliases, "unit-test")
+        key = ("2026-06-22 03:00", "西班牙", "沙特阿拉伯")
+        self.assertIn(key, markets)
+        self.assertEqual(markets[key]["line"], -1.25)
+        self.assertEqual(markets[key]["odds"], [1.92, 1.98])
+
+    def test_parse_zgzcw_ypdb_average_market(self):
+        html_text = """
+        <tr>
+          <td>平均*</td>
+          <td id="chupan-w-0" data="1.03">1.03</td>
+          <td id="chupan-s-0" data='1'>一球</td>
+          <td id="chupan-l-0" data="0.79">0.79</td>
+          <td cid="0" data="0.99"><a>0.99</a></td>
+          <td cid="0" data='1.25'><a>一/球半</a></td>
+          <td cid="0" data="0.88"><a>0.88</a></td>
+        </tr>
+        """
+        market = parse_zgzcw_ypdb_market(html_text)
+        self.assertIsNotNone(market)
+        self.assertEqual(market["line"], -1.25)
+        self.assertEqual(market["odds"], [1.99, 1.88])
 
     def test_qtx_supplement_dedupes_and_sorts_after_primary_rows(self):
         aliases = build_team_aliases({("西班牙", "沙特阿拉伯"): (0.6, 0.2, 0.2)})

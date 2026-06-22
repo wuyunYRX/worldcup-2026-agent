@@ -19,6 +19,15 @@ STATS_RESULTS_PATH = ROOT / "data" / "raw" / "statsbomb_matches_real.json"
 WC2026_RESULTS_PATH = ROOT / "data" / "raw" / "wc2026_football_data_matches.json"
 CALIBRATION_PATH = ROOT / "config" / "bayesian_calibration.json"
 OUTCOME_NAMES = ["主胜", "平", "客胜"]
+DIAGNOSIS_LABELS = {
+    "underestimated_total_goals": "低估总进球",
+    "overestimated_total_goals": "高估总进球",
+    "underestimated_draw": "低估平局",
+    "underestimated_underdog_goal": "低估弱队进球",
+    "underestimated_big_win": "低估大胜",
+    "wrong_goal_diff_direction": "净胜球方向错误",
+    "score_distribution_too_narrow": "比分分布过窄",
+}
 
 from worldcup_agent import (  # noqa: E402
     calibrate_wdl_probabilities,
@@ -212,6 +221,7 @@ def build_full_playback_samples(results: List[Dict[str, object]]) -> List[Dict[s
         actual_away = int(actual.get("away_goals", 0))
         outcome_idx = actual_outcome(actual_home, actual_away)
         score_prediction = score_prediction_from_wdl(probs)
+        diagnosis = score_diagnosis(score_prediction, actual_home, actual_away, probs)
         samples.append(
             {
                 "match_time": actual.get("match_time", ""),
@@ -225,6 +235,7 @@ def build_full_playback_samples(results: List[Dict[str, object]]) -> List[Dict[s
                 "predicted_top3": score_prediction.get("top_scores") or [],
                 "exact_hit": top1_hit(score_prediction, actual_home, actual_away),
                 "top3_hit": top3_hit(score_prediction, actual_home, actual_away),
+                **diagnosis,
                 "sample_source": source,
             }
         )
@@ -313,8 +324,140 @@ def top3_hit(prediction: Dict[str, object], actual_home: int, actual_away: int) 
     return False
 
 
+def ranked_scores(prediction: Dict[str, object], limit: int = 3) -> List[Tuple[int, int, float]]:
+    scores = score_distribution(prediction)
+    if not scores:
+        return []
+    return sorted(scores, key=lambda item: item[2], reverse=True)[:limit]
+
+
+def score_distribution(prediction: Dict[str, object]) -> List[Tuple[int, int, float]]:
+    raw_scores = prediction.get("score_grid") or prediction.get("top_scores") or []
+    scores: List[Tuple[int, int, float]] = []
+    for item in raw_scores:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+        try:
+            scores.append((int(item[0]), int(item[1]), max(float(item[2]), 0.0)))
+        except (TypeError, ValueError):
+            continue
+    total = sum(prob for _home, _away, prob in scores)
+    if total <= 0:
+        return []
+    return [(home, away, prob / total) for home, away, prob in scores]
+
+
+def score_expectations(prediction: Dict[str, object]) -> Dict[str, Optional[float]]:
+    dist = score_distribution(prediction)
+    if not dist:
+        return {
+            "expected_home_goals": None,
+            "expected_away_goals": None,
+            "expected_total_goals": None,
+            "expected_goal_diff": None,
+        }
+    home_goals = sum(home * prob for home, _away, prob in dist)
+    away_goals = sum(away * prob for _home, away, prob in dist)
+    return {
+        "expected_home_goals": home_goals,
+        "expected_away_goals": away_goals,
+        "expected_total_goals": home_goals + away_goals,
+        "expected_goal_diff": home_goals - away_goals,
+    }
+
+
+def has_big_win_in_top_scores(prediction: Dict[str, object], n: int = 3, margin: int = 3) -> bool:
+    for home, away, _prob in ranked_scores(prediction, n):
+        if abs(int(home) - int(away)) >= margin:
+            return True
+    return False
+
+
+def score_diagnosis(
+    prediction: Dict[str, object],
+    actual_home: int,
+    actual_away: int,
+    model_probs: Optional[Tuple[float, float, float]] = None,
+) -> Dict[str, object]:
+    expected = score_expectations(prediction)
+    expected_home = expected["expected_home_goals"]
+    expected_away = expected["expected_away_goals"]
+    expected_total = expected["expected_total_goals"]
+    expected_diff = expected["expected_goal_diff"]
+    actual_total = actual_home + actual_away
+    actual_diff = actual_home - actual_away
+    labels: List[str] = []
+
+    total_error = None if expected_total is None else expected_total - actual_total
+    diff_error = None if expected_diff is None else expected_diff - actual_diff
+    home_error = None if expected_home is None else expected_home - actual_home
+    away_error = None if expected_away is None else expected_away - actual_away
+
+    if total_error is not None:
+        if total_error <= -1.25:
+            labels.append("underestimated_total_goals")
+        elif total_error >= 1.25:
+            labels.append("overestimated_total_goals")
+    if diff_error is not None and expected_diff is not None and actual_diff != 0 and expected_diff * actual_diff < 0:
+        labels.append("wrong_goal_diff_direction")
+    if actual_home == actual_away and model_probs and max(range(3), key=lambda idx: model_probs[idx]) != 1:
+        labels.append("underestimated_draw")
+    if expected_home is not None and expected_away is not None:
+        actual_outcome_idx = actual_outcome(actual_home, actual_away)
+        if actual_outcome_idx == 0 and actual_away >= 1 and expected_away <= actual_away - 0.75:
+            labels.append("underestimated_underdog_goal")
+        elif actual_outcome_idx == 2 and actual_home >= 1 and expected_home <= actual_home - 0.75:
+            labels.append("underestimated_underdog_goal")
+    if abs(actual_diff) >= 3 and not has_big_win_in_top_scores(prediction, n=3, margin=3):
+        labels.append("underestimated_big_win")
+    if actual_total >= 4 and not any((home + away) >= 4 for home, away, _prob in ranked_scores(prediction, 3)):
+        labels.append("score_distribution_too_narrow")
+
+    return {
+        **expected,
+        "actual_total_goals": actual_total,
+        "actual_goal_diff": actual_diff,
+        "total_goals_error": total_error,
+        "goal_diff_error": diff_error,
+        "home_goals_error": home_error,
+        "away_goals_error": away_error,
+        "score_diagnosis": labels,
+    }
+
+
 def metric_summary(values: List[float]) -> Optional[float]:
     return sum(values) / len(values) if values else None
+
+
+def score_metric_summary(reviewed: List[Dict[str, object]], exact_hits: int, top3_hits: int) -> Dict[str, object]:
+    total_errors = [float(row["total_goals_error"]) for row in reviewed if row.get("total_goals_error") is not None]
+    diff_errors = [float(row["goal_diff_error"]) for row in reviewed if row.get("goal_diff_error") is not None]
+    labels = [label for row in reviewed for label in row.get("score_diagnosis", [])]
+
+    def label_rate(label: str) -> float:
+        return labels.count(label) / len(reviewed) if reviewed else 0.0
+
+    return {
+        "exact_score_accuracy": (exact_hits / len(reviewed)) if reviewed else 0.0,
+        "top3_hit_rate": (top3_hits / len(reviewed)) if reviewed else 0.0,
+        "avg_total_goals_error": metric_summary(total_errors),
+        "avg_abs_total_goals_error": metric_summary([abs(value) for value in total_errors]),
+        "avg_goal_diff_error": metric_summary(diff_errors),
+        "avg_abs_goal_diff_error": metric_summary([abs(value) for value in diff_errors]),
+        "underestimated_total_goals_rate": label_rate("underestimated_total_goals"),
+        "overestimated_total_goals_rate": label_rate("overestimated_total_goals"),
+        "underestimated_draw_rate": label_rate("underestimated_draw"),
+        "underestimated_underdog_goal_rate": label_rate("underestimated_underdog_goal"),
+        "underestimated_big_win_rate": label_rate("underestimated_big_win"),
+        "wrong_goal_diff_direction_rate": label_rate("wrong_goal_diff_direction"),
+        "score_distribution_too_narrow_rate": label_rate("score_distribution_too_narrow"),
+    }
+
+
+def diagnosis_label_text(labels: object) -> str:
+    if not isinstance(labels, list) or not labels:
+        return "无明显比分偏差标签"
+    return "、".join(DIAGNOSIS_LABELS.get(str(label), str(label)) for label in labels)
 
 
 def probability_stats(reviewed: List[Dict[str, object]], field: str) -> Dict[str, object]:
@@ -367,6 +510,13 @@ def build_advice(summary: Dict[str, object], reviewed: List[Dict[str, object]]) 
             advice.append("融合概率与模型概率表现一致，本轮没有市场赔率参与，暂不能判断融合权重优劣。")
     if score_top3 is not None and score_top3 < 0.35:
         advice.append("比分 Top3 命中率偏低，需复查 lambda 过强/过弱以及低比分重排规则。")
+    score_metrics = summary.get("score_metrics", {}) if isinstance(summary.get("score_metrics"), dict) else {}
+    if score_metrics.get("underestimated_total_goals_rate", 0.0) >= 0.25:
+        advice.append("低估总进球的场次占比较高，应检查总进球 lambda 和大比分尾部权重。")
+    if score_metrics.get("underestimated_draw_rate", 0.0) >= 0.25:
+        advice.append("实际平局但模型主方向非平局的场次偏多，应继续观察并可能提高平局保护。")
+    if score_metrics.get("underestimated_big_win_rate", 0.0) >= 0.20:
+        advice.append("强队大胜或客队大胜尾部覆盖不足，应让深盘/强弱差更明显地影响比分尾部分布。")
     upsets = [row for row in reviewed if row.get("model_probabilities") and row["model_probabilities"][int(row["actual_outcome_idx"])] < 0.25]
     if len(upsets) >= max(2, len(reviewed) // 3):
         advice.append("冷门或模型低估方向占比较高，建议在下一轮预测中降低强队方向集中度，并提高平局/客胜尾部概率。")
@@ -436,6 +586,14 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         "fused_logloss": fused_stats["logloss"],
         "score_exact_accuracy": summary["score_metrics"]["exact_score_accuracy"],
         "score_top3_hit_rate": summary["score_metrics"]["top3_hit_rate"],
+        "avg_total_goals_error": summary["score_metrics"].get("avg_total_goals_error"),
+        "avg_abs_total_goals_error": summary["score_metrics"].get("avg_abs_total_goals_error"),
+        "avg_goal_diff_error": summary["score_metrics"].get("avg_goal_diff_error"),
+        "avg_abs_goal_diff_error": summary["score_metrics"].get("avg_abs_goal_diff_error"),
+        "underestimated_total_goals_rate": summary["score_metrics"].get("underestimated_total_goals_rate"),
+        "underestimated_draw_rate": summary["score_metrics"].get("underestimated_draw_rate"),
+        "underestimated_underdog_goal_rate": summary["score_metrics"].get("underestimated_underdog_goal_rate"),
+        "underestimated_big_win_rate": summary["score_metrics"].get("underestimated_big_win_rate"),
         "last_review_file": summary["review_file"],
     }
     if full_playback:
@@ -579,16 +737,29 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
         f"- 回放 WDL 准确率：{summary.get('full_playback', {}).get('probability_metrics', {}).get('model', {}).get('accuracy'):.1%}" if summary.get('full_playback', {}).get('probability_metrics', {}).get('model', {}).get('accuracy') is not None else "- 回放 WDL 准确率：暂无",
         f"- 回放比分 Top3：{summary.get('full_playback', {}).get('score_metrics', {}).get('top3_hit_rate'):.1%}" if summary.get('full_playback', {}).get('score_metrics', {}).get('top3_hit_rate') is not None else "- 回放比分 Top3：暂无",
         "",
+        "## 1.2 比分诊断",
+        "",
+        f"- 平均总进球误差：{summary['score_metrics'].get('avg_total_goals_error'):.2f}" if summary['score_metrics'].get('avg_total_goals_error') is not None else "- 平均总进球误差：暂无",
+        f"- 平均总进球绝对误差：{summary['score_metrics'].get('avg_abs_total_goals_error'):.2f}" if summary['score_metrics'].get('avg_abs_total_goals_error') is not None else "- 平均总进球绝对误差：暂无",
+        f"- 平均净胜球误差：{summary['score_metrics'].get('avg_goal_diff_error'):.2f}" if summary['score_metrics'].get('avg_goal_diff_error') is not None else "- 平均净胜球误差：暂无",
+        f"- 平均净胜球绝对误差：{summary['score_metrics'].get('avg_abs_goal_diff_error'):.2f}" if summary['score_metrics'].get('avg_abs_goal_diff_error') is not None else "- 平均净胜球绝对误差：暂无",
+        f"- 低估总进球：{summary['score_metrics'].get('underestimated_total_goals_rate', 0.0):.1%}",
+        f"- 高估总进球：{summary['score_metrics'].get('overestimated_total_goals_rate', 0.0):.1%}",
+        f"- 低估平局：{summary['score_metrics'].get('underestimated_draw_rate', 0.0):.1%}",
+        f"- 低估弱队进球：{summary['score_metrics'].get('underestimated_underdog_goal_rate', 0.0):.1%}",
+        f"- 低估大胜：{summary['score_metrics'].get('underestimated_big_win_rate', 0.0):.1%}",
+        "",
         "## 2. 单场复盘",
         "",
     ]
     for row in summary["matches"]:
         model_probs = row.get("model_probabilities") or [0.0, 0.0, 0.0]
         predicted = row.get("model_top_outcome") or "未知"
+        diagnosis_text = diagnosis_label_text(row.get("score_diagnosis"))
         lines.append(
             f"- {row['match_time']} {row['home']} vs {row['away']}：实际 {row['actual_score']}（{row['actual_outcome']}），"
             f"模型主方向 {predicted}，AI前主方向 {row.get('base_model_top_outcome') or '未知'}，真实方向概率 {model_probs[int(row['actual_outcome_idx'])]:.1%}，"
-            f"比分 Top3 命中：{'是' if row['top3_hit'] else '否'}。"
+            f"比分 Top3 命中：{'是' if row['top3_hit'] else '否'}；诊断：{diagnosis_text}。"
         )
     lines.extend(
         [
@@ -642,6 +813,7 @@ def main() -> int:
         value_probs = normalize_probs(prediction_row.get("value_adjusted_probabilities"))
         market_probs = normalize_probs(prediction_row.get("market_probabilities")) or market_probs_from_odds(prediction_row.get("normal_odds"))
         fused_probs = normalize_probs(prediction_row.get("fused_probabilities")) or model_probs
+        diagnosis = score_diagnosis(prediction, actual_home, actual_away, model_probs)
         reviewed.append(
             {
                 "match_time": actual.get("match_time", ""),
@@ -670,6 +842,7 @@ def main() -> int:
                 "predicted_top3": prediction.get("top_scores") or [],
                 "exact_hit": exact,
                 "top3_hit": top3,
+                **diagnosis,
             }
         )
 
@@ -680,10 +853,7 @@ def main() -> int:
         "snapshots_scanned": len(snapshot_files()),
         "results_loaded": len(results),
         "reviewed_matches": len(reviewed),
-        "score_metrics": {
-            "exact_score_accuracy": (exact_hits / len(reviewed)) if reviewed else 0.0,
-            "top3_hit_rate": (top3_hits / len(reviewed)) if reviewed else 0.0,
-        },
+        "score_metrics": score_metric_summary(reviewed, exact_hits, top3_hits),
         "probability_metrics": {
             "base": probability_stats(reviewed, "base_model_probabilities"),
             "context": probability_stats(reviewed, "context_adjusted_probabilities"),
@@ -695,10 +865,11 @@ def main() -> int:
         },
         "full_playback": {
             "sample_size": len(full_playback),
-            "score_metrics": {
-                "exact_score_accuracy": (sum(1 for row in full_playback if row.get("exact_hit")) / len(full_playback)) if full_playback else 0.0,
-                "top3_hit_rate": (sum(1 for row in full_playback if row.get("top3_hit")) / len(full_playback)) if full_playback else 0.0,
-            },
+            "score_metrics": score_metric_summary(
+                full_playback,
+                sum(1 for row in full_playback if row.get("exact_hit")),
+                sum(1 for row in full_playback if row.get("top3_hit")),
+            ),
             "probability_metrics": {
                 "model": probability_stats(full_playback, "model_probabilities"),
             },

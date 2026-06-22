@@ -7,6 +7,7 @@ The report renderer uses Playwright to create a PNG screenshot for Telegram.
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import html
 import json
@@ -35,6 +36,7 @@ DEFAULT_ODDS_URL = "https://cp.zgzcw.com/lottery/jchtplayvsForJsp.action?lottery
 DEFAULT_QTX_WORLD_CUP_URL = "https://www.qtx.com/worldcup/"
 DEFAULT_FIFA_SCORES_URL = "https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/scores-fixtures"
 DEFAULT_TELEGRAM_API_BASE_URL = "https://api.telegram.org"
+DEFAULT_ASIAN_HANDICAP_PATH = ROOT / "data" / "raw" / "asian_handicap_markets.json"
 WC2026_RESULTS_PATH = ROOT / "data" / "raw" / "wc2026_football_data_matches.json"
 OUTCOME_NAMES = ["主胜", "平", "客胜"]
 DRAW_PROBABILITY_FLOOR = 0.22
@@ -171,6 +173,145 @@ def fetch_text(url: str, timeout: int = 25) -> str:
     return decode_page_bytes(data)
 
 
+def read_text_source(source: str, timeout: int = 25) -> str:
+    if source.startswith(("http://", "https://")):
+        return fetch_text(source, timeout=timeout)
+    path = Path(source)
+    if not path.is_absolute():
+        path = ROOT / path
+    return path.read_text(encoding="utf-8")
+
+
+def as_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def first_value(row: Dict[str, object], keys: Iterable[str]) -> object:
+    for key in keys:
+        if key in row and row[key] not in (None, ""):
+            return row[key]
+    return ""
+
+
+def normalize_asian_market_record(row: Dict[str, object], aliases: Dict[str, str]) -> Optional[dict]:
+    home_raw = first_value(row, ("home", "home_team", "host", "主队"))
+    away_raw = first_value(row, ("away", "away_team", "guest", "客队"))
+    if not home_raw or not away_raw:
+        return None
+    line_raw = first_value(row, ("asian_handicap_line", "line", "handicap", "ah_line", "盘口"))
+    line = parse_optional_handicap_line(line_raw)
+    if line is None:
+        return None
+    home_odds = as_float(first_value(row, ("home_odds", "home_water", "host_odds", "主队水位", "主水")))
+    away_odds = as_float(first_value(row, ("away_odds", "away_water", "guest_odds", "客队水位", "客水")))
+    if home_odds <= 1.0 or away_odds <= 1.0:
+        return None
+    return {
+        "match_time": normalize_text(str(first_value(row, ("match_time", "time", "kickoff", "比赛时间")))),
+        "home": resolve_team_name(str(home_raw), aliases),
+        "away": resolve_team_name(str(away_raw), aliases),
+        "line": line,
+        "odds": [home_odds, away_odds],
+    }
+
+
+def parse_asian_handicap_source(text: str, aliases: Dict[str, str], source: str = "") -> Dict[Tuple[str, str, str], dict]:
+    records: List[Dict[str, object]] = []
+    stripped = text.strip()
+    if not stripped:
+        return {}
+    if stripped.startswith(("[", "{")):
+        raw = json.loads(stripped)
+        if isinstance(raw, dict):
+            raw_records = raw.get("matches") or raw.get("markets") or raw.get("data") or []
+        else:
+            raw_records = raw
+        if isinstance(raw_records, list):
+            records = [item for item in raw_records if isinstance(item, dict)]
+    else:
+        records = [dict(row) for row in csv.DictReader(stripped.splitlines())]
+
+    markets: Dict[Tuple[str, str, str], dict] = {}
+    for record in records:
+        market = normalize_asian_market_record(record, aliases)
+        if not market:
+            continue
+        key = (market["match_time"], normalize_text(market["home"]), normalize_text(market["away"]))
+        markets[key] = {**market, "source": source}
+        fallback_key = ("", normalize_text(market["home"]), normalize_text(market["away"]))
+        markets.setdefault(fallback_key, {**market, "source": source})
+    return markets
+
+
+def load_asian_handicap_markets(source: str, aliases: Dict[str, str]) -> Dict[Tuple[str, str, str], dict]:
+    if not source:
+        return {}
+    try:
+        text = read_text_source(source)
+        return parse_asian_handicap_source(text, aliases, source)
+    except Exception as exc:
+        print(f"Asian handicap market source skipped: {exc}", file=sys.stderr)
+        return {}
+
+
+def asian_market_for_row(row: dict, markets: Dict[Tuple[str, str, str], dict]) -> Optional[dict]:
+    key = (normalize_text(str(row.get("match_time", ""))), normalize_text(str(row.get("home", ""))), normalize_text(str(row.get("away", ""))))
+    if key in markets:
+        return markets[key]
+    fallback_key = ("", key[1], key[2])
+    return markets.get(fallback_key)
+
+
+def asian_decimal_odds_from_water(value: float) -> float:
+    return value + 1.0 if 0.0 < value <= 10.0 else 0.0
+
+
+def parse_zgzcw_ypdb_market(text: str) -> Optional[dict]:
+    pos = text.find('id="chupan-w-0"')
+    if pos < 0:
+        pos = text.find("id='chupan-w-0'")
+    if pos < 0:
+        return None
+    start = text.rfind("<tr", 0, pos)
+    end = text.find("</tr>", pos)
+    if start < 0 or end < 0:
+        return None
+    row = text[start:end + 5]
+    data_values = [as_float(value, -999.0) for value in re.findall(r"\bdata\s*=\s*[\"']([^\"']*)[\"']", row)]
+    numeric_values = [value for value in data_values if value > -999.0]
+    if len(numeric_values) < 6:
+        return None
+    current_home_water, raw_line, current_away_water = numeric_values[3], numeric_values[4], numeric_values[5]
+    line_text_match = re.search(r"<td[^>]*cid=\"?0\"?[^>]*data\s*=\s*[\"'][^\"']+[\"'][^>]*>[\s\S]*?</td>\s*<td[^>]*cid=\"?0\"?[^>]*data\s*=\s*[\"'][^\"']+[\"'][^>]*>([\s\S]*?)</td>", row, flags=re.I)
+    line_text = normalize_text(re.sub(r"<[^>]+>", "", line_text_match.group(1))) if line_text_match else ""
+    line = abs(raw_line) if "受" in line_text else -abs(raw_line)
+    home_odds = asian_decimal_odds_from_water(current_home_water)
+    away_odds = asian_decimal_odds_from_water(current_away_water)
+    if home_odds <= 1.0 or away_odds <= 1.0:
+        return None
+    return {"line": line, "odds": [home_odds, away_odds]}
+
+
+def fetch_zgzcw_ypdb_market(play_id: str) -> Optional[dict]:
+    if not play_id:
+        return None
+    url = f"https://fenxi.zgzcw.com/{play_id}/ypdb"
+    try:
+        req = request.Request(url, headers={"User-Agent": "Mozilla/5.0 WorldCupAgent/1.0", "Referer": DEFAULT_ODDS_URL})
+        with request.urlopen(req, timeout=20) as resp:
+            text = decode_page_bytes(resp.read())
+    except Exception as exc:
+        print(f"Zgzcw asian handicap skipped for {play_id}: {exc}", file=sys.stderr)
+        return None
+    market = parse_zgzcw_ypdb_market(text)
+    if market:
+        market["source"] = url
+    return market
+
+
 def load_probability_model(path: Path) -> Dict[Tuple[str, str], Tuple[float, float, float]]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     model: Dict[Tuple[str, str], Tuple[float, float, float]] = {}
@@ -301,24 +442,24 @@ def row_probabilities(row: dict) -> Optional[Tuple[float, float, float]]:
 
 def apply_value_metrics(
     probabilities: Optional[Tuple[float, float, float]],
-    normal_odds: List[float],
+    odds: List[float],
     risk_config: Dict[str, float],
 ) -> Tuple[Tuple[float, float, float], Tuple[float, float, float], List[Optional[float]], List[float], List[float]]:
-    market_probs = market_probabilities_from_odds(normal_odds, None)
+    market_probs = market_probabilities_from_odds(odds, None)
     fused_probs = fuse_wdl_probabilities(probabilities, market_probs, risk_config.get("model_weight", 0.4))
     ev = [
-        fused_probs[idx] * normal_odds[idx] - 1 if normal_odds[idx] > 0 and fused_probs[idx] > 0 else None
+        fused_probs[idx] * odds[idx] - 1 if odds[idx] > 0 and fused_probs[idx] > 0 else None
         for idx in range(3)
     ]
     kelly_fractions = kelly_fractions_for_match(
         fused_probs,
-        normal_odds,
+        odds,
         risk_config.get("kelly_fraction", 0.25),
         risk_config.get("min_edge", 0.05),
     )
     kelly_stakes = kelly_stakes_for_match(
         fused_probs,
-        normal_odds,
+        odds,
         risk_config.get("bankroll", 10.0),
         risk_config.get("kelly_fraction", 0.25),
         risk_config.get("min_edge", 0.05),
@@ -342,6 +483,63 @@ def parse_float_triplet(part: str) -> List[float]:
     while len(nums) < 3:
         nums.append(0.0)
     return nums[:3]
+
+
+def parse_handicap_line(value: object) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    text = text.replace("+", "")
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def parse_float_pair(part: str) -> List[float]:
+    nums = []
+    for item in part.split():
+        try:
+            nums.append(float(item))
+        except ValueError:
+            nums.append(0.0)
+    while len(nums) < 2:
+        nums.append(0.0)
+    return nums[:2]
+
+
+def parse_optional_handicap_line(value: object) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = text.replace("+", "")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def parse_asian_market(parts: List[str], attrs: Dict[str, str]) -> Tuple[Optional[float], List[float]]:
+    line = None
+    for key in ("yp", "ah", "asian", "asianhandicap", "pankou"):
+        if key in attrs:
+            line = parse_optional_handicap_line(attrs.get(key))
+            if line is not None:
+                break
+
+    odds = [0.0, 0.0]
+    if len(parts) > 2:
+        values = parse_float_pair(parts[2])
+        if all(value > 1.0 for value in values):
+            odds = values
+
+    home_water = attrs.get("homewater") or attrs.get("hwater") or attrs.get("upwater")
+    away_water = attrs.get("awaywater") or attrs.get("awater") or attrs.get("downwater")
+    if home_water and away_water:
+        parsed = parse_float_pair(f"{home_water} {away_water}")
+        if all(value > 1.0 for value in parsed):
+            odds = parsed
+    return line, odds
 
 
 def poisson_probs(lam: float, max_goals: int = 7) -> List[float]:
@@ -372,6 +570,112 @@ def score_grid(home_lam: float, away_lam: float, max_goals: int = 7, rho: float 
     return [(h, a, prob / total) for h, a, prob in grid]
 
 
+def split_asian_handicap_line(line: float) -> List[float]:
+    line = round(line * 4) / 4
+    if int(round(abs(line) * 4)) % 2 == 0:
+        return [line]
+    return [math.floor(line * 2) / 2, math.ceil(line * 2) / 2]
+
+
+def asian_handicap_return_units(home_goals: int, away_goals: int, line: float) -> float:
+    returns = []
+    for part_line in split_asian_handicap_line(line):
+        adjusted_home = home_goals + part_line
+        if adjusted_home > away_goals:
+            returns.append(1.0)
+        elif adjusted_home == away_goals:
+            returns.append(0.0)
+        else:
+            returns.append(-1.0)
+    return sum(returns) / len(returns)
+
+
+def asian_handicap_probabilities_from_score_grid(
+    grid: List[Tuple[int, int, float]],
+    line: float,
+) -> Optional[Dict[str, float]]:
+    if not grid:
+        return None
+    result = {
+        "home_full_win": 0.0,
+        "home_half_win": 0.0,
+        "push": 0.0,
+        "home_half_loss": 0.0,
+        "home_full_loss": 0.0,
+    }
+    for home_goals, away_goals, prob in grid:
+        units = asian_handicap_return_units(home_goals, away_goals, line)
+        if units >= 1.0:
+            result["home_full_win"] += prob
+        elif units > 0.0:
+            result["home_half_win"] += prob
+        elif units == 0.0:
+            result["push"] += prob
+        elif units > -1.0:
+            result["home_half_loss"] += prob
+        else:
+            result["home_full_loss"] += prob
+    total = sum(result.values())
+    if total <= 0:
+        return None
+    return {key: value / total for key, value in result.items()}
+
+
+def asian_market_probabilities_from_odds(odds: List[float]) -> Tuple[float, float]:
+    if len(odds) >= 2 and all(value > 1.0 for value in odds[:2]):
+        implied = [1.0 / odds[0], 1.0 / odds[1]]
+        total = sum(implied)
+        if total > 0:
+            return implied[0] / total, implied[1] / total
+    return (0.0, 0.0)
+
+
+def asian_profit_for_units(units: float, odds: float) -> float:
+    if odds <= 1.0:
+        return 0.0
+    if units > 0:
+        return units * (odds - 1.0)
+    return units
+
+
+def asian_handicap_value_metrics(
+    grid: Optional[List[Tuple[int, int, float]]],
+    line: Optional[float],
+    odds: List[float],
+    risk_config: Dict[str, float],
+) -> Tuple[Optional[Dict[str, float]], Tuple[float, float], List[Optional[float]], List[float]]:
+    if not grid or line is None:
+        return None, asian_market_probabilities_from_odds(odds), [None, None], [0.0, 0.0]
+
+    probabilities = asian_handicap_probabilities_from_score_grid(grid, line)
+    market_probabilities = asian_market_probabilities_from_odds(odds)
+    ev: List[Optional[float]] = [None, None]
+    kelly_fractions = [0.0, 0.0]
+    for idx in range(2):
+        if idx >= len(odds) or odds[idx] <= 1.0:
+            continue
+        direction = 1.0 if idx == 0 else -1.0
+        expected_profit = 0.0
+        positive_units = 0.0
+        negative_units = 0.0
+        for home_goals, away_goals, prob in grid:
+            units = asian_handicap_return_units(home_goals, away_goals, line) * direction
+            expected_profit += prob * asian_profit_for_units(units, odds[idx])
+            if units > 0:
+                positive_units += prob * units
+            elif units < 0:
+                negative_units += prob * abs(units)
+        ev[idx] = expected_profit
+        effective_probability = positive_units / (positive_units + negative_units) if positive_units + negative_units > 0 else 0.0
+        kelly_fractions[idx] = fractional_kelly(
+            effective_probability,
+            odds[idx],
+            risk_config.get("kelly_fraction", 0.25),
+            risk_config.get("min_edge", 0.05),
+        )
+    return probabilities, market_probabilities, ev, kelly_fractions
+
+
 def rerank_score_grid(
     grid: List[Tuple[int, int, float]],
     lambda_home: float,
@@ -380,6 +684,10 @@ def rerank_score_grid(
     market_draw: float = 0.0,
     market_away: float = 0.0,
     target_probabilities: Optional[Tuple[float, float, float]] = None,
+    handicap_line: Optional[float] = None,
+    handicap_market_probabilities: Optional[Tuple[float, float, float]] = None,
+    asian_handicap_line: Optional[float] = None,
+    asian_market_probabilities: Optional[Tuple[float, float]] = None,
 ) -> List[Tuple[int, int, float]]:
     total_goals = lambda_home + lambda_away
     goal_diff = lambda_home - lambda_away
@@ -414,6 +722,24 @@ def rerank_score_grid(
                 weight *= 0.92 + target_draw * 0.45
             else:
                 weight *= 0.92 + target_away * 0.35
+        if handicap_line is not None and handicap_market_probabilities:
+            handicap_home, handicap_draw, handicap_away = handicap_market_probabilities
+            adjusted_home = home_goals + handicap_line
+            if adjusted_home > away_goals:
+                weight *= 0.90 + handicap_home * 0.45
+            elif adjusted_home == away_goals:
+                weight *= 0.90 + handicap_draw * 0.55
+            else:
+                weight *= 0.90 + handicap_away * 0.45
+        if asian_handicap_line is not None and asian_market_probabilities:
+            asian_home, asian_away = asian_market_probabilities
+            home_return = asian_handicap_return_units(home_goals, away_goals, asian_handicap_line)
+            if home_return > 0:
+                weight *= 0.92 + asian_home * 0.35
+            elif home_return < 0:
+                weight *= 0.92 + asian_away * 0.35
+            else:
+                weight *= 1.02
         if goal_diff >= 0.45 and home_goals > away_goals:
             weight *= 1.06
         if goal_diff <= -0.45 and away_goals > home_goals:
@@ -426,7 +752,13 @@ def rerank_score_grid(
     return [(home_goals, away_goals, prob / total) for home_goals, away_goals, prob in adjusted]
 
 
-def score_prediction_from_wdl(probabilities: Tuple[float, float, float]) -> dict:
+def score_prediction_from_wdl(
+    probabilities: Tuple[float, float, float],
+    handicap_line: Optional[float] = None,
+    handicap_market_probabilities: Optional[Tuple[float, float, float]] = None,
+    asian_handicap_line: Optional[float] = None,
+    asian_market_probabilities: Optional[Tuple[float, float]] = None,
+) -> dict:
     """Infer a simple Poisson score model from W/D/L probabilities.
 
     This is a transparent approximation, not a calibrated score market. It is
@@ -458,17 +790,60 @@ def score_prediction_from_wdl(probabilities: Tuple[float, float, float]) -> dict
                 best_lambdas = (home_lam, away_lam)
 
     grid = score_grid(best_lambdas[0], best_lambdas[1], max_goals=7)
-    grid = rerank_score_grid(grid, best_lambdas[0], best_lambdas[1], probabilities[0], probabilities[1], probabilities[2])
+    grid = rerank_score_grid(
+        grid,
+        best_lambdas[0],
+        best_lambdas[1],
+        probabilities[0],
+        probabilities[1],
+        probabilities[2],
+        probabilities,
+        handicap_line,
+        handicap_market_probabilities,
+        asian_handicap_line,
+        asian_market_probabilities,
+    )
     top_scores = sorted(grid, key=lambda item: item[2], reverse=True)[:3]
     over_25 = sum(prob for home_goals, away_goals, prob in grid if home_goals + away_goals >= 3)
     both_score = sum(prob for home_goals, away_goals, prob in grid if home_goals > 0 and away_goals > 0)
     return {
         "lambda_home": best_lambdas[0],
         "lambda_away": best_lambdas[1],
+        "score_grid": grid,
         "top_scores": top_scores,
         "over_25": over_25,
         "both_score": both_score,
     }
+
+
+def handicap_probabilities_from_score_prediction(
+    prediction: Optional[dict],
+    handicap_line: float,
+    target_probabilities: Optional[Tuple[float, float, float]] = None,
+) -> Optional[Tuple[float, float, float]]:
+    if not prediction:
+        return None
+    grid = prediction.get("score_grid") if isinstance(prediction, dict) else None
+    if not isinstance(grid, list) or not grid:
+        lambda_home = float(prediction.get("lambda_home", 0.0) or 0.0)
+        lambda_away = float(prediction.get("lambda_away", 0.0) or 0.0)
+        if lambda_home <= 0 or lambda_away < 0:
+            return None
+        grid = score_grid(lambda_home, lambda_away, max_goals=7)
+        grid = rerank_score_grid(grid, lambda_home, lambda_away, target_probabilities=target_probabilities)
+    home_cover = push = away_cover = 0.0
+    for home_goals, away_goals, prob in grid:
+        adjusted_home = home_goals + handicap_line
+        if adjusted_home > away_goals:
+            home_cover += prob
+        elif adjusted_home == away_goals:
+            push += prob
+        else:
+            away_cover += prob
+    total = home_cover + push + away_cover
+    if total <= 0:
+        return None
+    return home_cover / total, push / total, away_cover / total
 
 
 def clamp_exp(value: float) -> float:
@@ -677,6 +1052,10 @@ def score_prediction_from_trained_model(
     fallback_probabilities: Optional[Tuple[float, float, float]],
     strengths: Dict[str, float],
     prematch_news_index: Optional[Dict[Tuple[str, str, str], Dict[str, object]]] = None,
+    handicap_line: Optional[float] = None,
+    handicap_market_probabilities: Optional[Tuple[float, float, float]] = None,
+    asian_handicap_line: Optional[float] = None,
+    asian_market_probabilities: Optional[Tuple[float, float]] = None,
 ) -> Optional[dict]:
     if not score_model:
         return None
@@ -807,13 +1186,26 @@ def score_prediction_from_trained_model(
         except (TypeError, ValueError):
             rho = 0.0
     grid = score_grid(lambda_home, lambda_away, max_goals=7, rho=rho)
-    grid = rerank_score_grid(grid, lambda_home, lambda_away, market_home, market_draw, market_away, fallback_probabilities)
+    grid = rerank_score_grid(
+        grid,
+        lambda_home,
+        lambda_away,
+        market_home,
+        market_draw,
+        market_away,
+        fallback_probabilities,
+        handicap_line,
+        handicap_market_probabilities,
+        asian_handicap_line,
+        asian_market_probabilities,
+    )
     top_scores = sorted(grid, key=lambda item: item[2], reverse=True)[:3]
     over_25 = sum(prob for home_goals, away_goals, prob in grid if home_goals + away_goals >= 3)
     both_score = sum(prob for home_goals, away_goals, prob in grid if home_goals > 0 and away_goals > 0)
     return {
         "lambda_home": lambda_home,
         "lambda_away": lambda_away,
+        "score_grid": grid,
         "top_scores": top_scores,
         "over_25": over_25,
         "both_score": both_score,
@@ -914,6 +1306,8 @@ def parse_odds_page(
     model: Dict[Tuple[str, str], Tuple[float, float, float]],
     score_model: Optional[Dict[str, object]] = None,
     risk_config: Optional[Dict[str, float]] = None,
+    asian_markets: Optional[Dict[Tuple[str, str, str], dict]] = None,
+    enable_zgzcw_asian: bool = False,
 ) -> List[dict]:
     risk_config = risk_config or dict(DEFAULT_RISK_CONFIG)
     aliases = build_team_aliases(model)
@@ -952,6 +1346,22 @@ def parse_odds_page(
         parts = sp_value.split("|") if sp_value else []
         normal_odds = parse_float_triplet(parts[0]) if parts else [0.0, 0.0, 0.0]
         handicap_odds = parse_float_triplet(parts[1]) if len(parts) > 1 else [0.0, 0.0, 0.0]
+        handicap_line = parse_handicap_line(attrs.get("rq", ""))
+        handicap_market_preview = market_probabilities_from_odds(handicap_odds, None)
+        handicap_market_for_score = handicap_market_preview if sum(handicap_market_preview) > 0 else None
+        asian_handicap_line, asian_handicap_odds = parse_asian_market(parts, attrs)
+        external_asian_market = asian_market_for_row(
+            {"match_time": match_time, "home": home, "away": away},
+            asian_markets or {},
+        )
+        if external_asian_market is None and enable_zgzcw_asian:
+            play_id_match = re.search(r'newPlayid="?(\d+)"?', block, flags=re.I)
+            external_asian_market = fetch_zgzcw_ypdb_market(play_id_match.group(1) if play_id_match else "")
+        if external_asian_market:
+            asian_handicap_line = float(external_asian_market["line"])
+            asian_handicap_odds = list(external_asian_market["odds"])
+        asian_market_preview = asian_market_probabilities_from_odds(asian_handicap_odds)
+        asian_market_for_score = asian_market_preview if sum(asian_market_preview) > 0 else None
         base_probs = probs
         market_preview = market_probabilities_from_odds(normal_odds, probs)
         ai_probs, ai_adjustment = adjust_probabilities_with_ai_context(probs, prematch, risk_config, market_preview)
@@ -971,6 +1381,30 @@ def parse_odds_page(
             fallback_probabilities=probs,
             strengths=strengths,
             prematch_news_index=prematch_news_index,
+            handicap_line=handicap_line,
+            handicap_market_probabilities=handicap_market_for_score,
+            asian_handicap_line=asian_handicap_line,
+            asian_market_probabilities=asian_market_for_score,
+        )
+        score_prediction = trained_prediction or (
+            score_prediction_from_wdl(
+                probs,
+                handicap_line,
+                handicap_market_for_score,
+                asian_handicap_line,
+                asian_market_for_score,
+            )
+            if probs
+            else None
+        )
+        handicap_probs = handicap_probabilities_from_score_prediction(score_prediction, handicap_line, probs)
+        handicap_market_probs, handicap_fused_probs, handicap_ev, handicap_kelly_fractions, handicap_kelly_stakes = apply_value_metrics(handicap_probs, handicap_odds, risk_config)
+        score_grid_rows = (score_prediction or {}).get("score_grid") if isinstance(score_prediction, dict) else None
+        asian_probs, asian_market_probs, asian_ev, asian_kelly_fractions = asian_handicap_value_metrics(
+            score_grid_rows,
+            asian_handicap_line,
+            asian_handicap_odds,
+            risk_config,
         )
 
         rows.append(
@@ -994,10 +1428,23 @@ def parse_odds_page(
                 "fused_probabilities": fused_probs,
                 "normal_odds": normal_odds,
                 "handicap_odds": handicap_odds,
+                "asian_handicap_line": asian_handicap_line,
+                "asian_handicap_odds": asian_handicap_odds,
+                "asian_handicap_probabilities": asian_probs,
+                "asian_handicap_market_probabilities": asian_market_probs,
+                "asian_handicap_ev": asian_ev,
+                "asian_handicap_kelly_fractions": asian_kelly_fractions,
+                "asian_handicap_source": (external_asian_market or {}).get("source", ""),
+                "handicap_probabilities": handicap_probs,
+                "handicap_market_probabilities": handicap_market_probs,
+                "handicap_fused_probabilities": handicap_fused_probs,
+                "handicap_ev": handicap_ev,
+                "handicap_kelly_fractions": handicap_kelly_fractions,
+                "handicap_kelly_stakes": handicap_kelly_stakes,
                 "ev": ev,
                 "kelly_fractions": kelly_fractions,
                 "kelly_stakes": kelly_stakes,
-                "score_prediction": trained_prediction or (score_prediction_from_wdl(probs) if probs else None),
+                "score_prediction": score_prediction,
             }
         )
     return sorted(rows, key=lambda r: (r["match_time"], r["num"]))
@@ -1049,6 +1496,8 @@ def fetch_qtx_future_matches(
                 prematch = prematch_news_index.get((normalize_text(match_time), normalize_text(home), normalize_text(away)))
                 normal_odds = [0.0, 0.0, 0.0]
                 handicap_odds = [0.0, 0.0, 0.0]
+                asian_handicap_line = None
+                asian_handicap_odds = [0.0, 0.0]
                 base_probs = probs
                 ai_probs, ai_adjustment = adjust_probabilities_with_ai_context(probs, prematch, risk_config, None)
                 probs = ai_probs
@@ -1064,6 +1513,16 @@ def fetch_qtx_future_matches(
                     fallback_probabilities=probs,
                     strengths=strengths,
                     prematch_news_index=prematch_news_index,
+                )
+                score_prediction = trained_prediction or (score_prediction_from_wdl(probs) if probs else None)
+                handicap_probs = handicap_probabilities_from_score_prediction(score_prediction, 0.0, probs)
+                handicap_market_probs, handicap_fused_probs, handicap_ev, handicap_kelly_fractions, handicap_kelly_stakes = apply_value_metrics(handicap_probs, handicap_odds, risk_config)
+                score_grid_rows = (score_prediction or {}).get("score_grid") if isinstance(score_prediction, dict) else None
+                asian_probs, asian_market_probs, asian_ev, asian_kelly_fractions = asian_handicap_value_metrics(
+                    score_grid_rows,
+                    asian_handicap_line,
+                    asian_handicap_odds,
+                    risk_config,
                 )
                 rows.append(
                     {
@@ -1086,10 +1545,22 @@ def fetch_qtx_future_matches(
                         "fused_probabilities": fused_probs,
                         "normal_odds": normal_odds,
                         "handicap_odds": handicap_odds,
+                        "asian_handicap_line": asian_handicap_line,
+                        "asian_handicap_odds": asian_handicap_odds,
+                        "asian_handicap_probabilities": asian_probs,
+                        "asian_handicap_market_probabilities": asian_market_probs,
+                        "asian_handicap_ev": asian_ev,
+                        "asian_handicap_kelly_fractions": asian_kelly_fractions,
+                        "handicap_probabilities": handicap_probs,
+                        "handicap_market_probabilities": handicap_market_probs,
+                        "handicap_fused_probabilities": handicap_fused_probs,
+                        "handicap_ev": handicap_ev,
+                        "handicap_kelly_fractions": handicap_kelly_fractions,
+                        "handicap_kelly_stakes": handicap_kelly_stakes,
                         "ev": ev,
                         "kelly_fractions": kelly_fractions,
                         "kelly_stakes": kelly_stakes,
-                        "score_prediction": trained_prediction or (score_prediction_from_wdl(probs) if probs else None),
+                        "score_prediction": score_prediction,
                     }
                 )
             except Exception:
@@ -1125,6 +1596,36 @@ def merge_candidate_rows(primary_rows: List[dict], extra_rows: List[dict]) -> Li
     return sorted(merged.values(), key=lambda item: (item.get("match_time", ""), item.get("home", ""), item.get("away", "")))
 
 
+def apply_external_asian_markets(
+    rows: List[dict],
+    markets: Dict[Tuple[str, str, str], dict],
+    risk_config: Dict[str, float],
+) -> None:
+    for row in rows:
+        market = asian_market_for_row(row, markets)
+        if not market:
+            continue
+        line = market.get("line")
+        odds = market.get("odds") or [0.0, 0.0]
+        if line is None or not isinstance(odds, list):
+            continue
+        row["asian_handicap_line"] = float(line)
+        row["asian_handicap_odds"] = odds[:2]
+        row["asian_handicap_source"] = market.get("source", "")
+        score_prediction = row.get("score_prediction") or {}
+        grid = score_prediction.get("score_grid") if isinstance(score_prediction, dict) else None
+        asian_probs, asian_market_probs, asian_ev, asian_kelly_fractions = asian_handicap_value_metrics(
+            grid,
+            row["asian_handicap_line"],
+            row["asian_handicap_odds"],
+            risk_config,
+        )
+        row["asian_handicap_probabilities"] = asian_probs
+        row["asian_handicap_market_probabilities"] = asian_market_probs
+        row["asian_handicap_ev"] = asian_ev
+        row["asian_handicap_kelly_fractions"] = asian_kelly_fractions
+
+
 def is_qtx_supplement(row: dict) -> bool:
     return str(row.get("num", "")) == "QTX补充"
 
@@ -1137,6 +1638,26 @@ def probability_text(probabilities: Optional[Tuple[float, float, float]]) -> str
     if not probabilities:
         return "待补模型"
     return " / ".join(pct(x) for x in probabilities)
+
+
+def handicap_probability_text(row: dict) -> str:
+    probabilities = row.get("handicap_fused_probabilities") or row.get("handicap_probabilities")
+    if not probabilities:
+        return "待补让球概率"
+    return " / ".join(pct(x) for x in probabilities)
+
+
+def asian_probability_text(row: dict) -> str:
+    probabilities = row.get("asian_handicap_probabilities")
+    if not probabilities:
+        return "待补亚盘概率"
+    return (
+        f"全赢 {pct(probabilities.get('home_full_win', 0.0))} / "
+        f"半赢 {pct(probabilities.get('home_half_win', 0.0))} / "
+        f"走 {pct(probabilities.get('push', 0.0))} / "
+        f"半输 {pct(probabilities.get('home_half_loss', 0.0))} / "
+        f"全输 {pct(probabilities.get('home_full_loss', 0.0))}"
+    )
 
 
 def score_prediction_text(prediction: Optional[dict]) -> str:
@@ -1244,6 +1765,11 @@ def best_ev_remark(row: dict) -> str:
         return f"最佳 EV：{OUTCOME_NAMES[best_idx]} {ev_text(best)}，但 Kelly 不足最低投注门槛，建议观望。"
     if best is not None and best > -0.02:
         return f"接近保本：{OUTCOME_NAMES[best_idx]} {ev_text(best)}。"
+    handicap_probs = row.get("handicap_fused_probabilities") or row.get("handicap_probabilities")
+    handicap_ev = row.get("handicap_ev") or []
+    if handicap_probs and any(value is not None and value > 0 for value in handicap_ev):
+        best_idx = max(range(3), key=lambda idx: handicap_ev[idx] if idx < len(handicap_ev) and handicap_ev[idx] is not None else -999)
+        return f"不让球赔率偏低；让球 {row['handicap']} 方向 {OUTCOME_NAMES[best_idx]} EV {ev_text(handicap_ev[best_idx])}。"
     return "热门方向赔率被压低，暂不作主推。"
 
 
@@ -1444,8 +1970,10 @@ def row_html(row: dict) -> str:
         f"<td>{html.escape(probability_text(base_probs))}</td>"
         f"<td>{html.escape(probability_cell)}</td>"
         f"<td>{html.escape(fused_probability_cell)}</td>"
+        f"<td>{html.escape(handicap_probability_text(row))}</td>"
         f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
         f"<td>{html.escape(odds_text(row['normal_odds']))}</td>"
+        f"<td>{html.escape(odds_text(row['handicap_odds']))}</td>"
         f"<td>{ev_cells}</td>"
         f"<td>{html.escape(kelly_cells)}</td>"
         f"<td>{html.escape(best_ev_remark(row))}</td>"
@@ -1485,9 +2013,6 @@ def generate_report(
         f"<td>{html.escape(row['match_time'])}</td>"
         f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
         f"<td>{html.escape(result_pick_text(row))}</td>"
-        f"<td>{html.escape(probability_text(row.get('base_probabilities') or row['probabilities']))}</td>"
-        f"<td>{html.escape(probability_text(row['probabilities']))}</td>"
-        f"<td>{html.escape(probability_text(row.get('fused_probabilities') or row['probabilities']))}</td>"
         f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
         f"<td>{html.escape(goal_trend_text(row['score_prediction']))}</td>"
         "</tr>"
@@ -1508,6 +2033,38 @@ def generate_report(
         "</tr>"
         for value, row, idx in candidates[:12]
     )
+
+    handicap_rows = "\n".join(
+        "<tr>"
+        f"<td>{html.escape(row['num'])}</td>"
+        f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
+        f"<td>{html.escape(str(row['handicap']))}</td>"
+        f"<td>{html.escape(handicap_probability_text(row))}</td>"
+        f"<td>{html.escape(odds_text(row['handicap_odds']))}</td>"
+        f"<td>{html.escape(' / '.join(ev_text(x) for x in (row.get('handicap_ev') or [])))}</td>"
+        f"<td>{html.escape(' / '.join(f'{value * 100:.1f}%' for value in (row.get('handicap_kelly_fractions') or [])))}</td>"
+        "</tr>"
+        for row in display_rows
+        if any(value > 0 for value in row.get('handicap_odds', []))
+    )
+    if not handicap_rows:
+        handicap_rows = '<tr><td colspan="7">当前没有可计算的让球胜平负赔率。</td></tr>'
+
+    asian_rows = "\n".join(
+        "<tr>"
+        f"<td>{html.escape(row['num'])}</td>"
+        f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
+        f"<td>{html.escape(str(row.get('asian_handicap_line')))}</td>"
+        f"<td>{html.escape(asian_probability_text(row))}</td>"
+        f"<td>{html.escape(' / '.join(f'{value:.2f}' for value in (row.get('asian_handicap_odds') or [])))}</td>"
+        f"<td>{html.escape(' / '.join(ev_text(x) for x in (row.get('asian_handicap_ev') or [])))}</td>"
+        f"<td>{html.escape(' / '.join(f'{value * 100:.1f}%' for value in (row.get('asian_handicap_kelly_fractions') or [])))}</td>"
+        "</tr>"
+        for row in display_rows
+        if row.get("asian_handicap_line") is not None and any(value > 0 for value in row.get("asian_handicap_odds", []))
+    )
+    if not asian_rows:
+        asian_rows = '<tr><td colspan="7">当前数据源未提供标准亚盘盘口/水位；已保留亚盘结算框架，待数据接入后自动启用。</td></tr>'
 
     ticket_rows = "\n".join(
         "<tr>"
@@ -1575,7 +2132,7 @@ th {{ background: #eef3f8; text-align: left; }}
 
 <section id="result-predictions">
 <h2>赛果预测总览</h2>
-<table><thead><tr><th>编号</th><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>修正前概率</th><th>AI修正后概率</th><th>融合概率</th><th>比分 Top3</th><th>进球倾向</th></tr></thead><tbody>
+<table><thead><tr><th>编号</th><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>比分 Top3</th><th>进球倾向</th></tr></thead><tbody>
 {result_rows}
 </tbody></table>
 </section>
@@ -1587,8 +2144,22 @@ th {{ background: #eef3f8; text-align: left; }}
 
 <section id="remaining-probabilities">
 <h2>赔率与概率明细</h2>
-<table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>修正前概率</th><th>AI修正后概率</th><th>融合概率</th><th>最可能比分</th><th>当前不让球赔率（主胜/平/客胜）</th><th>EV（主胜/平/客胜）</th><th>Kelly%</th><th>备注</th></tr></thead><tbody>
+<table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>基础概率</th><th>模型概率</th><th>融合概率</th><th>让球预测</th><th>最可能比分</th><th>当前不让球赔率（主胜/平/客胜）</th><th>让球赔率（胜/平/负）</th><th>EV（主胜/平/客胜）</th><th>Kelly%</th><th>备注</th></tr></thead><tbody>
 {''.join(row_html(row) for row in display_rows)}
+</tbody></table>
+</section>
+
+<section id="handicap-board">
+<h2>辅助：让球胜平负筛选</h2>
+<table><thead><tr><th>编号</th><th>场次</th><th>让球</th><th>让球融合概率</th><th>让球赔率</th><th>让球 EV</th><th>让球 Kelly%</th></tr></thead><tbody>
+{handicap_rows}
+</tbody></table>
+</section>
+
+<section id="asian-handicap-board">
+<h2>辅助：亚盘筛选</h2>
+<table><thead><tr><th>编号</th><th>场次</th><th>盘口</th><th>主队让球结算概率</th><th>主/客水位</th><th>亚盘 EV</th><th>亚盘 Kelly%</th></tr></thead><tbody>
+{asian_rows}
 </tbody></table>
 </section>
 
@@ -1769,7 +2340,21 @@ def serialize_rows(rows: List[dict], generated_at: dt.datetime, odds_url: str) -
                 "market_probabilities": row.get("market_probabilities"),
                 "fused_probabilities": row.get("fused_probabilities"),
                 "normal_odds": row.get("normal_odds"),
+                "handicap": row.get("handicap"),
                 "handicap_odds": row.get("handicap_odds"),
+                "asian_handicap_line": row.get("asian_handicap_line"),
+                "asian_handicap_odds": row.get("asian_handicap_odds"),
+                "asian_handicap_probabilities": row.get("asian_handicap_probabilities"),
+                "asian_handicap_market_probabilities": row.get("asian_handicap_market_probabilities"),
+                "asian_handicap_ev": row.get("asian_handicap_ev"),
+                "asian_handicap_kelly_fractions": row.get("asian_handicap_kelly_fractions"),
+                "asian_handicap_source": row.get("asian_handicap_source"),
+                "handicap_probabilities": row.get("handicap_probabilities"),
+                "handicap_market_probabilities": row.get("handicap_market_probabilities"),
+                "handicap_fused_probabilities": row.get("handicap_fused_probabilities"),
+                "handicap_ev": row.get("handicap_ev"),
+                "handicap_kelly_fractions": row.get("handicap_kelly_fractions"),
+                "handicap_kelly_stakes": row.get("handicap_kelly_stakes"),
                 "ev": row.get("ev"),
                 "kelly_fractions": row.get("kelly_fractions"),
                 "kelly_stakes": row.get("kelly_stakes"),
@@ -1777,6 +2362,7 @@ def serialize_rows(rows: List[dict], generated_at: dt.datetime, odds_url: str) -
                     "lambda_home": prediction.get("lambda_home"),
                     "lambda_away": prediction.get("lambda_away"),
                     "top_scores": prediction.get("top_scores"),
+                    "score_grid": prediction.get("score_grid"),
                     "over_25": prediction.get("over_25"),
                     "both_score": prediction.get("both_score"),
                     "prematch_adjustments": prediction.get("prematch_adjustments"),
@@ -1818,7 +2404,21 @@ def serialize_training_candidates(rows: List[dict], generated_at: dt.datetime) -
                 "value_adjusted_probabilities": row.get("value_adjusted_probabilities"),
                 "ai_adjustment": row.get("ai_adjustment"),
                 "normal_odds": row.get("normal_odds"),
+                "handicap": row.get("handicap"),
                 "handicap_odds": row.get("handicap_odds"),
+                "asian_handicap_line": row.get("asian_handicap_line"),
+                "asian_handicap_odds": row.get("asian_handicap_odds"),
+                "asian_handicap_probabilities": row.get("asian_handicap_probabilities"),
+                "asian_handicap_market_probabilities": row.get("asian_handicap_market_probabilities"),
+                "asian_handicap_ev": row.get("asian_handicap_ev"),
+                "asian_handicap_kelly_fractions": row.get("asian_handicap_kelly_fractions"),
+                "asian_handicap_source": row.get("asian_handicap_source"),
+                "handicap_probabilities": row.get("handicap_probabilities"),
+                "handicap_market_probabilities": row.get("handicap_market_probabilities"),
+                "handicap_fused_probabilities": row.get("handicap_fused_probabilities"),
+                "handicap_ev": row.get("handicap_ev"),
+                "handicap_kelly_fractions": row.get("handicap_kelly_fractions"),
+                "handicap_kelly_stakes": row.get("handicap_kelly_stakes"),
                 "home_injury_count": prematch.get("home_injury_count", 0),
                 "away_injury_count": prematch.get("away_injury_count", 0),
                 "home_suspension_count": prematch.get("home_suspension_count", 0),
@@ -1874,16 +2474,28 @@ def main() -> int:
     score_model_path = ROOT / env.get("SCORE_MODEL_PATH", "models/score_model/score_model_v1.json")
     score_model = load_score_model(score_model_path)
     risk_config = load_risk_config(ROOT / "config" / "bayesian_calibration.json", env)
+    asian_handicap_source = env.get("ASIAN_HANDICAP_URL") or env.get("ASIAN_HANDICAP_PATH", "")
+    asian_markets = load_asian_handicap_markets(asian_handicap_source, build_team_aliases(model)) if asian_handicap_source else {}
+    enable_zgzcw_asian = env.get("ENABLE_ZGZCW_ASIAN_HANDICAP", "0").lower() in {"1", "true", "yes", "on"}
     if args.odds_html:
         page = decode_page_bytes(Path(args.odds_html).read_bytes())
     else:
         page = fetch_text(odds_url)
 
-    rows = parse_odds_page(page, model, score_model=score_model, risk_config=risk_config)
+    rows = parse_odds_page(
+        page,
+        model,
+        score_model=score_model,
+        risk_config=risk_config,
+        asian_markets=asian_markets,
+        enable_zgzcw_asian=enable_zgzcw_asian,
+    )
     qtx_enabled = args.qtx_supplement or env.get("QTX_SUPPLEMENT", "0").lower() in {"1", "true", "yes", "on"}
     if qtx_enabled:
         qtx_rows = fetch_qtx_future_matches(model, score_model=score_model, risk_config=risk_config, qtx_url=qtx_world_cup_url)
         rows = merge_candidate_rows(rows, qtx_rows)
+    if asian_markets:
+        apply_external_asian_markets(rows, asian_markets, risk_config)
     generated_at = dt.datetime.now()
     rows = filter_nearby_rows(rows, generated_at, days=args.days)
     if not rows:
