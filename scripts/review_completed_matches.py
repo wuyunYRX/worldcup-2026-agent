@@ -6,17 +6,27 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 RUN_DOCS_DIR = ROOT / "docs" / "run"
 REVIEW_DOCS_DIR = ROOT / "docs" / "review"
 STATS_RESULTS_PATH = ROOT / "data" / "raw" / "statsbomb_matches_real.json"
 WC2026_RESULTS_PATH = ROOT / "data" / "raw" / "wc2026_football_data_matches.json"
 CALIBRATION_PATH = ROOT / "config" / "bayesian_calibration.json"
 OUTCOME_NAMES = ["主胜", "平", "客胜"]
+
+from worldcup_agent import (  # noqa: E402
+    calibrate_wdl_probabilities,
+    estimate_match_probabilities,
+    infer_team_strengths,
+    load_probability_model,
+    score_prediction_from_wdl,
+)
 
 EN_CN = {
     "Mexico": "墨西哥",
@@ -168,6 +178,59 @@ def load_results() -> List[Dict[str, object]]:
     return sorted(merged.values(), key=lambda row: str(row.get("match_time", "")))
 
 
+def load_probability_config() -> Dict[str, float]:
+    if CALIBRATION_PATH.exists():
+        try:
+            raw = json.loads(CALIBRATION_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return {key: float(value) for key, value in raw.items() if isinstance(value, (int, float))}
+        except Exception:
+            return {}
+    return {}
+
+
+def build_full_playback_samples(results: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    model_path = ROOT / "config" / "model_probabilities.json"
+    if not model_path.exists():
+        return []
+    model = load_probability_model(model_path)
+    strengths = infer_team_strengths(model)
+    calibration_config = load_probability_config()
+    samples: List[Dict[str, object]] = []
+    for actual in results:
+        home = str(actual.get("home_team", ""))
+        away = str(actual.get("away_team", ""))
+        if not home or not away:
+            continue
+        probs = model.get((home, away))
+        source = "model_probability_table"
+        if probs is None:
+            probs = estimate_match_probabilities(home, away, strengths)
+            source = "strength_estimate_fallback"
+        probs = calibrate_wdl_probabilities(probs, calibration_config)
+        actual_home = int(actual.get("home_goals", 0))
+        actual_away = int(actual.get("away_goals", 0))
+        outcome_idx = actual_outcome(actual_home, actual_away)
+        score_prediction = score_prediction_from_wdl(probs)
+        samples.append(
+            {
+                "match_time": actual.get("match_time", ""),
+                "home": home,
+                "away": away,
+                "actual_score": f"{actual_home}-{actual_away}",
+                "actual_outcome": OUTCOME_NAMES[outcome_idx],
+                "actual_outcome_idx": outcome_idx,
+                "model_probabilities": probs,
+                "model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: probs[idx])],
+                "predicted_top3": score_prediction.get("top_scores") or [],
+                "exact_hit": top1_hit(score_prediction, actual_home, actual_away),
+                "top3_hit": top3_hit(score_prediction, actual_home, actual_away),
+                "sample_source": source,
+            }
+        )
+    return samples
+
+
 def snapshot_files() -> List[Path]:
     return sorted(RUN_DOCS_DIR.glob("worldcup-2026-agent-predictions_*.json"))
 
@@ -280,6 +343,7 @@ def probability_stats(reviewed: List[Dict[str, object]], field: str) -> Dict[str
 
 def build_advice(summary: Dict[str, object], reviewed: List[Dict[str, object]]) -> List[str]:
     advice = []
+    base_stats = summary["probability_metrics"].get("base", {})
     model_stats = summary["probability_metrics"]["model"]
     market_stats = summary["probability_metrics"].get("market", {})
     fused_stats = summary["probability_metrics"]["fused"]
@@ -287,6 +351,11 @@ def build_advice(summary: Dict[str, object], reviewed: List[Dict[str, object]]) 
 
     if model_stats["sample_size"] and model_stats["avg_actual_prob"] is not None and model_stats["avg_actual_prob"] < 0.45:
         advice.append("真实赛果在模型分配的平均概率偏低，说明当前 WDL 概率校准偏乐观或方向偏差较大，应降低 Kelly 信号强度。")
+    if base_stats.get("sample_size") and base_stats.get("brier") is not None and model_stats["brier"] is not None:
+        if model_stats["brier"] < base_stats["brier"] - 1e-9:
+            advice.append("AI 赛前情报修正后的 Brier 优于修正前模型，可继续保留默认开启。")
+        elif model_stats["brier"] > base_stats["brier"] + 1e-9:
+            advice.append("AI 赛前情报修正后的 Brier 暂未优于修正前模型，需控制修正幅度并继续观察。")
     if fused_stats["sample_size"] and fused_stats["brier"] is not None and model_stats["brier"] is not None:
         if fused_stats["brier"] > model_stats["brier"] + 1e-9:
             advice.append("融合概率 Brier 暂未优于模型概率，样本不足时不建议继续提高市场权重。")
@@ -322,18 +391,34 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
 
     probability_metrics = summary["probability_metrics"]
     model_stats = probability_metrics["model"]
+    base_stats = probability_metrics.get("base", {})
     market_stats = probability_metrics["market"]
     fused_stats = probability_metrics["fused"]
+    full_playback = summary.get("full_playback", {}) if isinstance(summary.get("full_playback"), dict) else {}
+    full_model_stats = full_playback.get("probability_metrics", {}).get("model", {}) if isinstance(full_playback.get("probability_metrics"), dict) else {}
+    full_score_metrics = full_playback.get("score_metrics", {}) if isinstance(full_playback.get("score_metrics"), dict) else {}
     sample_size = int(summary["reviewed_matches"])
+    config.setdefault("draw_probability_floor", 0.22)
+    config.setdefault("balanced_match_draw_floor", 0.26)
+    config.setdefault("strong_favorite_draw_floor", 0.25)
+    config.setdefault("max_draw_calibration_boost", 0.08)
+    config.setdefault("underdog_probability_floor", 0.18)
+    config.setdefault("max_underdog_calibration_boost", 0.03)
+    config.setdefault("enable_ai_probability_adjustment", 1.0)
+    config.setdefault("ai_probability_max_delta", 0.03)
+    config.setdefault("ai_probability_high_confidence_delta", 0.05)
 
     config["calibration"] = {
         "sample_size": sample_size,
+        "base_model_accuracy": base_stats.get("accuracy"),
         "model_accuracy": model_stats["accuracy"],
         "market_accuracy": market_stats["accuracy"],
         "fused_accuracy": fused_stats["accuracy"],
         "model_brier": model_stats["brier"],
+        "base_model_brier": base_stats.get("brier"),
         "market_brier": market_stats["brier"],
         "fused_brier": fused_stats["brier"],
+        "base_model_logloss": base_stats.get("logloss"),
         "model_logloss": model_stats["logloss"],
         "market_logloss": market_stats["logloss"],
         "fused_logloss": fused_stats["logloss"],
@@ -341,6 +426,12 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         "score_top3_hit_rate": summary["score_metrics"]["top3_hit_rate"],
         "last_review_file": summary["review_file"],
     }
+    if full_playback:
+        config["calibration"]["full_playback_sample_size"] = full_playback.get("sample_size")
+        config["calibration"]["full_playback_model_accuracy"] = full_model_stats.get("accuracy")
+        config["calibration"]["full_playback_model_brier"] = full_model_stats.get("brier")
+        config["calibration"]["full_playback_model_logloss"] = full_model_stats.get("logloss")
+        config["calibration"]["full_playback_score_top3_hit_rate"] = full_score_metrics.get("top3_hit_rate")
 
     if sample_size < 100:
         config["model_weight"] = config.get("model_weight", 0.4)
@@ -353,6 +444,22 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
             config["model_weight"] = max(0.2, current - 0.05)
         config["calibration"]["model_weight_decision"] = "adjusted_by_brier_score"
 
+    if base_stats.get("sample_size") and base_stats.get("brier") is not None and model_stats.get("brier") is not None:
+        ai_delta = float(config.get("ai_probability_max_delta", 0.03))
+        ai_high_delta = float(config.get("ai_probability_high_confidence_delta", 0.05))
+        if model_stats["brier"] < base_stats["brier"] - 0.005:
+            config["ai_probability_max_delta"] = min(0.05, ai_delta + 0.005)
+            config["ai_probability_high_confidence_delta"] = min(0.07, ai_high_delta + 0.005)
+            config["calibration"]["ai_adjustment_decision"] = "ai_outperforms_base_expand_delta"
+        elif model_stats["brier"] > base_stats["brier"] + 0.005:
+            config["ai_probability_max_delta"] = max(0.015, ai_delta - 0.005)
+            config["ai_probability_high_confidence_delta"] = max(0.025, ai_high_delta - 0.005)
+            config["calibration"]["ai_adjustment_decision"] = "ai_underperforms_base_reduce_delta"
+        else:
+            config["calibration"]["ai_adjustment_decision"] = "ai_matches_base_keep_delta"
+    else:
+        config["calibration"]["ai_adjustment_decision"] = "missing_ai_review_sample_keep_delta"
+
     avg_actual_prob = model_stats.get("avg_actual_prob")
     top3_rate = summary["score_metrics"].get("top3_hit_rate")
     if sample_size > 0 and ((avg_actual_prob is not None and avg_actual_prob < 0.45) or (top3_rate is not None and top3_rate < 0.35)):
@@ -362,6 +469,21 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
     else:
         config["calibration"]["risk_adjustment_decision"] = "keep_current_risk_settings"
 
+    full_sample_size = int(full_playback.get("sample_size", 0) or 0) if full_playback else 0
+    if full_sample_size >= 10:
+        draw_rows = [row for row in summary.get("full_playback_matches", []) if int(row.get("actual_outcome_idx", -1)) == 1 and row.get("model_probabilities")]
+        low_draw_hits = [row for row in draw_rows if row["model_probabilities"][1] < 0.25]
+        if draw_rows and len(low_draw_hits) / len(draw_rows) >= 0.4:
+            config["draw_probability_floor"] = min(0.26, max(float(config.get("draw_probability_floor", 0.22)), 0.23))
+            config["balanced_match_draw_floor"] = min(0.29, max(float(config.get("balanced_match_draw_floor", 0.26)), 0.27))
+            config["strong_favorite_draw_floor"] = min(0.28, max(float(config.get("strong_favorite_draw_floor", 0.25)), 0.26))
+            config["max_draw_calibration_boost"] = min(0.10, max(float(config.get("max_draw_calibration_boost", 0.08)), 0.09))
+            config["calibration"]["probability_parameter_decision"] = "full_playback_raises_draw_protection"
+        else:
+            config["calibration"]["probability_parameter_decision"] = "full_playback_keep_probability_parameters"
+    elif full_playback:
+        config["calibration"]["probability_parameter_decision"] = "full_playback_sample_below_10_keep_parameters"
+
     CALIBRATION_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     summary["risk_config"] = {
         "kelly_fraction": config.get("kelly_fraction"),
@@ -369,7 +491,10 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         "bankroll": config.get("bankroll"),
         "max_stake_per_pick": config.get("max_stake_per_pick"),
         "max_total_stake": config.get("max_total_stake"),
+        "ai_probability_max_delta": config.get("ai_probability_max_delta"),
+        "ai_probability_high_confidence_delta": config.get("ai_probability_high_confidence_delta"),
     }
+    summary["calibration_ai_decision"] = config["calibration"].get("ai_adjustment_decision")
 
 
 def write_reflection_report(summary: Dict[str, object]) -> Path:
@@ -389,8 +514,16 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
         f"- 比分 Exact：{summary['score_metrics']['exact_score_accuracy']:.1%}",
         f"- 比分 Top3：{summary['score_metrics']['top3_hit_rate']:.1%}",
         f"- WDL 模型方向准确率：{model_stats['accuracy']:.1%}" if model_stats["accuracy"] is not None else "- WDL 模型方向准确率：暂无",
+        f"- AI 修正前 WDL 准确率：{summary['probability_metrics']['base']['accuracy']:.1%}" if summary['probability_metrics']['base']['accuracy'] is not None else "- AI 修正前 WDL 准确率：暂无",
         f"- 模型 Brier：{model_stats['brier']:.4f}" if model_stats["brier"] is not None else "- 模型 Brier：暂无",
+        f"- AI 修正前 Brier：{summary['probability_metrics']['base']['brier']:.4f}" if summary['probability_metrics']['base']['brier'] is not None else "- AI 修正前 Brier：暂无",
         f"- 融合 Brier：{fused_stats['brier']:.4f}" if fused_stats["brier"] is not None else "- 融合 Brier：暂无",
+        "",
+        "## 1.1 全量已完赛回放校准",
+        "",
+        f"- 回放样本：{summary.get('full_playback', {}).get('sample_size', 0)} 场（使用当前模型回放，非真实赛前快照）。",
+        f"- 回放 WDL 准确率：{summary.get('full_playback', {}).get('probability_metrics', {}).get('model', {}).get('accuracy'):.1%}" if summary.get('full_playback', {}).get('probability_metrics', {}).get('model', {}).get('accuracy') is not None else "- 回放 WDL 准确率：暂无",
+        f"- 回放比分 Top3：{summary.get('full_playback', {}).get('score_metrics', {}).get('top3_hit_rate'):.1%}" if summary.get('full_playback', {}).get('score_metrics', {}).get('top3_hit_rate') is not None else "- 回放比分 Top3：暂无",
         "",
         "## 2. 单场复盘",
         "",
@@ -400,7 +533,7 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
         predicted = row.get("model_top_outcome") or "未知"
         lines.append(
             f"- {row['match_time']} {row['home']} vs {row['away']}：实际 {row['actual_score']}（{row['actual_outcome']}），"
-            f"模型主方向 {predicted}，真实方向概率 {model_probs[int(row['actual_outcome_idx'])]:.1%}，"
+            f"模型主方向 {predicted}，AI前主方向 {row.get('base_model_top_outcome') or '未知'}，真实方向概率 {model_probs[int(row['actual_outcome_idx'])]:.1%}，"
             f"比分 Top3 命中：{'是' if row['top3_hit'] else '否'}。"
         )
     lines.extend(
@@ -409,6 +542,7 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
             "## 3. 反思与调整",
             "",
             *[f"- {item}" for item in summary["advice"]],
+            f"- AI 修正幅度调优：{summary.get('calibration_ai_decision', 'keep_current_ai_delta')}；当前普通修正上限 {summary['risk_config'].get('ai_probability_max_delta', 0.03):.3f}，高置信度上限 {summary['risk_config'].get('ai_probability_high_confidence_delta', 0.05):.3f}。",
             f"- 本轮样本只有 {summary['reviewed_matches']} 场，不调整模型/市场融合权重；只做短期风控收紧。",
             f"- 已将 Kelly 从 1/4 降到不高于 1/5，并将最小 EV 门槛提高到 7%；总投入上限保留为 {summary['risk_config']['max_total_stake']:.0f} 元。",
             "",
@@ -427,6 +561,7 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
 def main() -> int:
     predictions = load_snapshot_predictions()
     results = load_results()
+    full_playback = build_full_playback_samples(results)
     reviewed = []
     exact_hits = 0
     top3_hits = 0
@@ -445,6 +580,7 @@ def main() -> int:
         exact_hits += 1 if exact else 0
         top3_hits += 1 if top3 else 0
         model_probs = normalize_probs(prediction_row.get("probabilities"))
+        base_probs = normalize_probs(prediction_row.get("base_probabilities")) or model_probs
         market_probs = normalize_probs(prediction_row.get("market_probabilities")) or market_probs_from_odds(prediction_row.get("normal_odds"))
         fused_probs = normalize_probs(prediction_row.get("fused_probabilities")) or model_probs
         reviewed.append(
@@ -457,9 +593,12 @@ def main() -> int:
                 "actual_outcome_idx": outcome_idx,
                 "snapshot": prediction_row.get("snapshot", ""),
                 "generated_at": prediction_row.get("generated_at", ""),
+                "base_model_probabilities": base_probs,
                 "model_probabilities": model_probs,
                 "market_probabilities": market_probs,
                 "fused_probabilities": fused_probs,
+                "ai_adjustment": prediction_row.get("ai_adjustment") or {},
+                "base_model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: base_probs[idx])] if base_probs else None,
                 "model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: model_probs[idx])] if model_probs else None,
                 "fused_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: fused_probs[idx])] if fused_probs else None,
                 "predicted_top3": prediction.get("top_scores") or [],
@@ -480,10 +619,22 @@ def main() -> int:
             "top3_hit_rate": (top3_hits / len(reviewed)) if reviewed else 0.0,
         },
         "probability_metrics": {
+            "base": probability_stats(reviewed, "base_model_probabilities"),
             "model": probability_stats(reviewed, "model_probabilities"),
             "market": probability_stats(reviewed, "market_probabilities"),
             "fused": probability_stats(reviewed, "fused_probabilities"),
         },
+        "full_playback": {
+            "sample_size": len(full_playback),
+            "score_metrics": {
+                "exact_score_accuracy": (sum(1 for row in full_playback if row.get("exact_hit")) / len(full_playback)) if full_playback else 0.0,
+                "top3_hit_rate": (sum(1 for row in full_playback if row.get("top3_hit")) / len(full_playback)) if full_playback else 0.0,
+            },
+            "probability_metrics": {
+                "model": probability_stats(full_playback, "model_probabilities"),
+            },
+        },
+        "full_playback_matches": full_playback,
         "matches": reviewed,
         "review_file": out_path.name,
     }
@@ -496,6 +647,7 @@ def main() -> int:
     print(f"Snapshots scanned: {summary['snapshots_scanned']}")
     print(f"Results loaded: {summary['results_loaded']}")
     print(f"Reviewed matches: {summary['reviewed_matches']}")
+    print(f"Full playback matches: {summary['full_playback']['sample_size']}")
     print(f"Exact score accuracy: {summary['score_metrics']['exact_score_accuracy']:.4f}")
     print(f"Top3 hit rate: {summary['score_metrics']['top3_hit_rate']:.4f}")
     print(f"Model WDL accuracy: {summary['probability_metrics']['model']['accuracy']}")

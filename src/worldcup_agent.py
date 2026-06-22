@@ -21,15 +21,20 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from urllib import parse, request
 
 try:
+    from .ai_probability_adjustment import adjust_probabilities_with_ai_context
     from .kelly_criterion import fractional_kelly, kelly_fractions_for_match, kelly_stakes_for_match
     from .probability_fusion import fuse_wdl_probabilities
 except ImportError:
+    from ai_probability_adjustment import adjust_probabilities_with_ai_context
     from kelly_criterion import fractional_kelly, kelly_fractions_for_match, kelly_stakes_for_match
     from probability_fusion import fuse_wdl_probabilities
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ODDS_URL = "https://cp.zgzcw.com/lottery/jchtplayvsForJsp.action?lotteryId=47&type=jcmini"
+DEFAULT_QTX_WORLD_CUP_URL = "https://www.qtx.com/worldcup/"
+DEFAULT_FIFA_SCORES_URL = "https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/scores-fixtures"
+DEFAULT_TELEGRAM_API_BASE_URL = "https://api.telegram.org"
 WC2026_RESULTS_PATH = ROOT / "data" / "raw" / "wc2026_football_data_matches.json"
 OUTCOME_NAMES = ["主胜", "平", "客胜"]
 DRAW_PROBABILITY_FLOOR = 0.22
@@ -46,6 +51,15 @@ DEFAULT_RISK_CONFIG = {
     "min_stake": 2.0,
     "max_stake_per_pick": 5.0,
     "max_total_stake": 15.0,
+    "draw_probability_floor": DRAW_PROBABILITY_FLOOR,
+    "balanced_match_draw_floor": BALANCED_MATCH_DRAW_FLOOR,
+    "strong_favorite_draw_floor": STRONG_FAVORITE_DRAW_FLOOR,
+    "max_draw_calibration_boost": MAX_DRAW_CALIBRATION_BOOST,
+    "underdog_probability_floor": UNDERDOG_PROBABILITY_FLOOR,
+    "max_underdog_calibration_boost": MAX_UNDERDOG_CALIBRATION_BOOST,
+    "enable_ai_probability_adjustment": 1.0,
+    "ai_probability_max_delta": 0.03,
+    "ai_probability_high_confidence_delta": 0.05,
 }
 TEAM_TRANSLATIONS = {
     "Mexico": "墨西哥",
@@ -199,6 +213,17 @@ def load_risk_config(path: Path, env: Optional[Dict[str, str]] = None) -> Dict[s
             config["bankroll"] = float(env["BANKROLL"])
         except ValueError:
             pass
+    if env:
+        for key, target in (
+            ("ENABLE_AI_PROBABILITY_ADJUSTMENT", "enable_ai_probability_adjustment"),
+            ("AI_PROBABILITY_MAX_DELTA", "ai_probability_max_delta"),
+            ("AI_PROBABILITY_HIGH_CONFIDENCE_DELTA", "ai_probability_high_confidence_delta"),
+        ):
+            if env.get(key):
+                try:
+                    config[target] = float(env[key])
+                except ValueError:
+                    pass
     return config
 
 
@@ -350,6 +375,7 @@ def rerank_score_grid(
     market_home: float = 0.0,
     market_draw: float = 0.0,
     market_away: float = 0.0,
+    target_probabilities: Optional[Tuple[float, float, float]] = None,
 ) -> List[Tuple[int, int, float]]:
     total_goals = lambda_home + lambda_away
     goal_diff = lambda_home - lambda_away
@@ -376,6 +402,14 @@ def rerank_score_grid(
             weight *= 1.08
         if market_draw >= 0.20 and home_goals == away_goals and score_sum <= 2:
             weight *= 1.06
+        if target_probabilities:
+            target_home, target_draw, target_away = target_probabilities
+            if home_goals > away_goals:
+                weight *= 0.92 + target_home * 0.35
+            elif home_goals == away_goals:
+                weight *= 0.92 + target_draw * 0.45
+            else:
+                weight *= 0.92 + target_away * 0.35
         if goal_diff >= 0.45 and home_goals > away_goals:
             weight *= 1.06
         if goal_diff <= -0.45 and away_goals > home_goals:
@@ -452,7 +486,14 @@ def market_probabilities_from_odds(normal_odds: List[float], fallback: Optional[
     return (0.0, 0.0, 0.0)
 
 
-def calibrate_wdl_probabilities(probabilities: Tuple[float, float, float]) -> Tuple[float, float, float]:
+def calibrate_wdl_probabilities(probabilities: Tuple[float, float, float], calibration_config: Optional[Dict[str, float]] = None) -> Tuple[float, float, float]:
+    calibration_config = calibration_config or {}
+    draw_probability_floor = float(calibration_config.get("draw_probability_floor", DRAW_PROBABILITY_FLOOR))
+    balanced_match_draw_floor = float(calibration_config.get("balanced_match_draw_floor", BALANCED_MATCH_DRAW_FLOOR))
+    strong_favorite_draw_floor = float(calibration_config.get("strong_favorite_draw_floor", STRONG_FAVORITE_DRAW_FLOOR))
+    max_draw_calibration_boost = float(calibration_config.get("max_draw_calibration_boost", MAX_DRAW_CALIBRATION_BOOST))
+    underdog_probability_floor = float(calibration_config.get("underdog_probability_floor", UNDERDOG_PROBABILITY_FLOOR))
+    max_underdog_calibration_boost = float(calibration_config.get("max_underdog_calibration_boost", MAX_UNDERDOG_CALIBRATION_BOOST))
     home, draw, away = probabilities
     total = home + draw + away
     if total <= 0:
@@ -461,13 +502,13 @@ def calibrate_wdl_probabilities(probabilities: Tuple[float, float, float]) -> Tu
 
     favorite_idx = 0 if home >= away else 2
     favorite = max(home, away)
-    draw_target = DRAW_PROBABILITY_FLOOR
+    draw_target = draw_probability_floor
     if abs(home - away) <= 0.20:
-        draw_target = max(draw_target, BALANCED_MATCH_DRAW_FLOOR)
+        draw_target = max(draw_target, balanced_match_draw_floor)
     if favorite >= 0.60:
-        draw_target = max(draw_target, STRONG_FAVORITE_DRAW_FLOOR)
+        draw_target = max(draw_target, strong_favorite_draw_floor)
 
-    boost = min(max(draw_target - draw, 0.0), MAX_DRAW_CALIBRATION_BOOST)
+    boost = min(max(draw_target - draw, 0.0), max_draw_calibration_boost)
     if boost <= 0:
         return home, draw, away
 
@@ -480,7 +521,7 @@ def calibrate_wdl_probabilities(probabilities: Tuple[float, float, float]) -> Tu
     underdog_idx = 2 if home >= away else 0
     underdog = away if underdog_idx == 2 else home
     favorite = home if underdog_idx == 2 else away
-    underdog_boost = min(max(UNDERDOG_PROBABILITY_FLOOR - underdog, 0.0), MAX_UNDERDOG_CALIBRATION_BOOST)
+    underdog_boost = min(max(underdog_probability_floor - underdog, 0.0), max_underdog_calibration_boost)
     if underdog_boost > 0 and favorite > underdog_boost:
         if underdog_idx == 2:
             home -= underdog_boost
@@ -667,7 +708,7 @@ def score_prediction_from_trained_model(
         except (TypeError, ValueError):
             rho = 0.0
     grid = score_grid(lambda_home, lambda_away, max_goals=7, rho=rho)
-    grid = rerank_score_grid(grid, lambda_home, lambda_away, market_home, market_draw, market_away)
+    grid = rerank_score_grid(grid, lambda_home, lambda_away, market_home, market_draw, market_away, fallback_probabilities)
     top_scores = sorted(grid, key=lambda item: item[2], reverse=True)[:3]
     over_25 = sum(prob for home_goals, away_goals, prob in grid if home_goals + away_goals >= 3)
     both_score = sum(prob for home_goals, away_goals, prob in grid if home_goals > 0 and away_goals > 0)
@@ -798,18 +839,24 @@ def parse_odds_page(
         if probs is None:
             probs = estimate_match_probabilities(home, away, strengths)
         if probs is not None:
-            probs = calibrate_wdl_probabilities(probs)
+            probs = calibrate_wdl_probabilities(probs, risk_config)
 
         match_time = ""
         match_time_match = re.search(r'title="比赛时间:([^"]+)"', block)
         if match_time_match:
             match_time = normalize_text(match_time_match.group(1))
 
+        prematch = prematch_news_index.get((normalize_text(match_time), normalize_text(home), normalize_text(away)))
+
         sp_arr_match = re.search(r'class="spArr"[\s\S]*?value="([^"]*)"', block)
         sp_value = html.unescape(sp_arr_match.group(1)) if sp_arr_match else ""
         parts = sp_value.split("|") if sp_value else []
         normal_odds = parse_float_triplet(parts[0]) if parts else [0.0, 0.0, 0.0]
         handicap_odds = parse_float_triplet(parts[1]) if len(parts) > 1 else [0.0, 0.0, 0.0]
+        base_probs = probs
+        market_preview = market_probabilities_from_odds(normal_odds, probs)
+        ai_probs, ai_adjustment = adjust_probabilities_with_ai_context(probs, prematch, risk_config, market_preview)
+        probs = ai_probs
         market_probs, fused_probs, ev, kelly_fractions, kelly_stakes = apply_value_metrics(probs, normal_odds, risk_config)
 
         stage = "小组赛"
@@ -837,7 +884,10 @@ def parse_odds_page(
                 "deadline": attrs.get("t", ""),
                 "handicap": attrs.get("rq", ""),
                 "single": attrs.get("dg", ""),
+                "base_probabilities": base_probs,
                 "probabilities": probs,
+                "ai_adjusted_probabilities": probs,
+                "ai_adjustment": ai_adjustment,
                 "market_probabilities": market_probs,
                 "fused_probabilities": fused_probs,
                 "normal_odds": normal_odds,
@@ -855,6 +905,7 @@ def fetch_qtx_future_matches(
     model: Dict[Tuple[str, str], Tuple[float, float, float]],
     score_model: Optional[Dict[str, object]] = None,
     risk_config: Optional[Dict[str, float]] = None,
+    qtx_url: str = DEFAULT_QTX_WORLD_CUP_URL,
 ) -> List[dict]:
     try:
         from playwright.sync_api import sync_playwright
@@ -870,7 +921,7 @@ def fetch_qtx_future_matches(
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1440, "height": 2200})
-        page.goto("https://www.qtx.com/worldcup/", wait_until="domcontentloaded", timeout=60000)
+        page.goto(qtx_url, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(5000)
         for anchor in page.locator("a").all():
             try:
@@ -891,10 +942,14 @@ def fetch_qtx_future_matches(
                     probs = estimate_match_probabilities(home, away, strengths)
                 if probs is None:
                     continue
-                probs = calibrate_wdl_probabilities(probs)
+                probs = calibrate_wdl_probabilities(probs, risk_config)
                 match_time = f"2026-{parts[1]}"
+                prematch = prematch_news_index.get((normalize_text(match_time), normalize_text(home), normalize_text(away)))
                 normal_odds = [0.0, 0.0, 0.0]
                 handicap_odds = [0.0, 0.0, 0.0]
+                base_probs = probs
+                ai_probs, ai_adjustment = adjust_probabilities_with_ai_context(probs, prematch, risk_config, None)
+                probs = ai_probs
                 market_probs, fused_probs, ev, kelly_fractions, kelly_stakes = apply_value_metrics(probs, normal_odds, risk_config)
                 trained_prediction = score_prediction_from_trained_model(
                     score_model=score_model,
@@ -918,7 +973,10 @@ def fetch_qtx_future_matches(
                         "deadline": "",
                         "handicap": "",
                         "single": "",
+                        "base_probabilities": base_probs,
                         "probabilities": probs,
+                        "ai_adjusted_probabilities": probs,
+                        "ai_adjustment": ai_adjustment,
                         "market_probabilities": market_probs,
                         "fused_probabilities": fused_probs,
                         "normal_odds": normal_odds,
@@ -1117,6 +1175,63 @@ def select_ticket(rows: List[dict], risk_config: Optional[Dict[str, float]] = No
     return picks
 
 
+def predicted_outcome(row: dict) -> Tuple[int, float, float]:
+    probabilities = row_probabilities(row) or row.get("probabilities") or (0.0, 0.0, 0.0)
+    best_idx = max(range(3), key=lambda idx: probabilities[idx])
+    sorted_probs = sorted(probabilities, reverse=True)
+    margin = sorted_probs[0] - sorted_probs[1] if len(sorted_probs) >= 2 else sorted_probs[0]
+    return best_idx, probabilities[best_idx], margin
+
+
+def confidence_text(probability: float, margin: float) -> str:
+    if probability >= 0.62 and margin >= 0.18:
+        return "高"
+    if probability >= 0.50 and margin >= 0.10:
+        return "中高"
+    if probability >= 0.40 and margin >= 0.06:
+        return "中"
+    return "低"
+
+
+def goal_trend_text(prediction: Optional[dict]) -> str:
+    if not prediction:
+        return "待补模型"
+    over_25 = float(prediction.get("over_25", 0.0))
+    both_score = float(prediction.get("both_score", 0.0))
+    total_goals = float(prediction.get("lambda_home", 0.0)) + float(prediction.get("lambda_away", 0.0))
+    total_label = "偏大" if over_25 >= 0.55 else "偏小" if over_25 <= 0.45 else "中性"
+    both_label = "双方进球倾向" if both_score >= 0.52 else "一方零封倾向" if both_score <= 0.38 else "双方进球中性"
+    return f"{total_label}球，预期总进球 {total_goals:.2f}；{both_label}"
+
+
+def result_pick_text(row: dict) -> str:
+    idx, probability, margin = predicted_outcome(row)
+    return f"{OUTCOME_NAMES[idx]} {pct(probability, 1)}（信心{confidence_text(probability, margin)}）"
+
+
+def result_reason_text(row: dict) -> str:
+    idx, probability, margin = predicted_outcome(row)
+    market = row.get("market_probabilities") or (0.0, 0.0, 0.0)
+    model = row.get("probabilities") or (0.0, 0.0, 0.0)
+    market_hint = "赔率未开，主要看模型" if not any(market) else f"市场去水 {pct(market[idx], 1)}，模型 {pct(model[idx], 1)}"
+    return f"领先第二方向 {pct(margin, 1)}；{market_hint}"
+
+
+def ai_adjustment_summary(row: dict) -> str:
+    adjustment = row.get("ai_adjustment") or {}
+    if not adjustment.get("enabled"):
+        return "AI修正关闭"
+    if not adjustment.get("applied"):
+        reason = adjustment.get("reason", "无有效情报")
+        return f"AI未修正：{reason}"
+    delta = adjustment.get("delta") or [0.0, 0.0, 0.0]
+    reasons = adjustment.get("reasons") or []
+    confidence = str(adjustment.get("confidence", "low"))
+    delta_text = " / ".join(f"{OUTCOME_NAMES[idx]} {delta[idx] * 100:+.1f}%" for idx in range(min(3, len(delta))))
+    reason_text = "、".join(str(item) for item in reasons[:3]) if reasons else "赛前情报修正"
+    return f"{delta_text}；置信度 {confidence}；{reason_text}"
+
+
 def ticket_metrics(picks: List[Tuple[dict, int]], stake_per_pick: float = 2.0) -> Tuple[float, float, float, float]:
     if not picks:
         return 0.0, 0.0, 0.0, 0.0
@@ -1201,6 +1316,7 @@ def ticket_metrics_with_stakes(picks: List[Tuple[dict, int]]) -> Tuple[float, fl
 
 
 def row_html(row: dict) -> str:
+    base_probs = row.get("base_probabilities") or row["probabilities"]
     probs = row["probabilities"]
     fused_probs = row.get("fused_probabilities") or probs
     evs = row["ev"]
@@ -1214,9 +1330,11 @@ def row_html(row: dict) -> str:
         f"<td>{html.escape(row['num'])}</td>"
         f"<td>{html.escape(row['match_time'])}</td>"
         f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
+        f"<td>{html.escape(probability_text(base_probs))}</td>"
         f"<td>{html.escape(probability_cell)}</td>"
         f"<td>{html.escape(fused_probability_cell)}</td>"
         f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
+        f"<td>{html.escape(ai_adjustment_summary(row))}</td>"
         f"<td>{html.escape(odds_text(row['normal_odds']))}</td>"
         f"<td>{ev_cells}</td>"
         f"<td>{html.escape(kelly_cells)}</td>"
@@ -1225,7 +1343,13 @@ def row_html(row: dict) -> str:
     )
 
 
-def generate_report(rows: List[dict], odds_url: str, generated_at: dt.datetime, risk_config: Optional[Dict[str, float]] = None) -> str:
+def generate_report(
+    rows: List[dict],
+    odds_url: str,
+    generated_at: dt.datetime,
+    risk_config: Optional[Dict[str, float]] = None,
+    fifa_scores_url: str = DEFAULT_FIFA_SCORES_URL,
+) -> str:
     risk_config = risk_config or dict(DEFAULT_RISK_CONFIG)
     candidates = select_candidates(rows)
     picks = select_ticket(rows, risk_config)
@@ -1238,12 +1362,29 @@ def generate_report(rows: List[dict], odds_url: str, generated_at: dt.datetime, 
         "<tr>"
         f"<td>{html.escape(row['match_time'])}</td>"
         f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
-        f"<td>{html.escape(probability_text(row['probabilities']))}</td>"
+        f"<td>{html.escape(result_pick_text(row))}</td>"
         f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
-        f"<td>{html.escape(odds_text(row['normal_odds']))}</td>"
-        f"<td>{html.escape(best_ev_remark(row))}</td>"
+        f"<td>{html.escape(goal_trend_text(row['score_prediction']))}</td>"
+        f"<td>{html.escape(result_reason_text(row))}；{html.escape(ai_adjustment_summary(row))}</td>"
         "</tr>"
         for row in focus
+    )
+
+    result_rows = "\n".join(
+        "<tr>"
+        f"<td>{html.escape(row['num'])}</td>"
+        f"<td>{html.escape(row['match_time'])}</td>"
+        f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
+        f"<td>{html.escape(result_pick_text(row))}</td>"
+        f"<td>{html.escape(probability_text(row.get('base_probabilities') or row['probabilities']))}</td>"
+        f"<td>{html.escape(probability_text(row['probabilities']))}</td>"
+        f"<td>{html.escape(probability_text(row.get('fused_probabilities') or row['probabilities']))}</td>"
+        f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
+        f"<td>{html.escape(goal_trend_text(row['score_prediction']))}</td>"
+        f"<td>{html.escape(ai_adjustment_summary(row))}</td>"
+        f"<td>{html.escape(result_reason_text(row))}</td>"
+        "</tr>"
+        for row in display_rows
     )
 
     candidate_rows = "\n".join(
@@ -1290,7 +1431,7 @@ def generate_report(rows: List[dict], odds_url: str, generated_at: dt.datetime, 
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>世界杯每日预测与购彩报告</title>
+<title>世界杯每日赛果预测报告</title>
 <style>
 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; line-height: 1.55; color: #172033; background: #f6f8fb; margin: 0; padding: 24px; }}
 main {{ max-width: 1180px; margin: 0 auto; background: #fff; padding: 28px; border: 1px solid #d9e1ec; }}
@@ -1309,9 +1450,9 @@ th {{ background: #eef3f8; text-align: left; }}
 </head>
 <body>
 <main>
-<h1>世界杯每日预测与购彩报告</h1>
+<h1>世界杯每日赛果预测报告</h1>
 <p class="stamp">生成时间：{generated_at.strftime("%Y-%m-%d %H:%M:%S")}（本机时间）</p>
-<p class="notice">所有概率均为模型与市场赔率的保守融合估计，不是保证命中，也不是官方建议。购彩建议只用于控制风险和比较赔率价值，请控制预算、少串关，不要把预测当确定收益。</p>
+<p class="notice">本报告优先服务于比赛结果预测，赔率、EV 和 Kelly 仅作为辅助参考；所有概率不是保证命中，也不是官方建议。</p>
 
 <section id="summary">
 <h2>本轮摘要</h2>
@@ -1319,9 +1460,16 @@ th {{ background: #eef3f8; text-align: left; }}
 </section>
 
 <section id="matches-24h">
-<h2>今日/未来 24 小时重点比赛</h2>
-<table><thead><tr><th>开赛时间</th><th>场次</th><th>模型胜平负概率</th><th>最可能比分</th><th>当前不让球赔率</th><th>判断</th></tr></thead><tbody>
+<h2>今日/未来 24 小时重点预测</h2>
+<table><thead><tr><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>最可能比分</th><th>进球倾向</th><th>预测依据</th></tr></thead><tbody>
 {focus_rows}
+</tbody></table>
+</section>
+
+<section id="result-predictions">
+<h2>赛果预测总览</h2>
+<table><thead><tr><th>编号</th><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>修正前概率</th><th>AI修正后概率</th><th>融合概率</th><th>比分 Top3</th><th>进球倾向</th><th>AI修正</th><th>依据</th></tr></thead><tbody>
+{result_rows}
 </tbody></table>
 </section>
 
@@ -1336,14 +1484,14 @@ th {{ background: #eef3f8; text-align: left; }}
 </section>
 
 <section id="remaining-probabilities">
-<h2>当前剩余可售世界杯场次</h2>
-<table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>模型胜平负概率（主胜/平/客胜）</th><th>融合概率</th><th>最可能比分</th><th>当前不让球赔率（主胜/平/客胜）</th><th>EV（主胜/平/客胜）</th><th>Kelly%</th><th>备注</th></tr></thead><tbody>
+<h2>赔率与概率明细</h2>
+<table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>修正前概率</th><th>AI修正后概率</th><th>融合概率</th><th>最可能比分</th><th>AI修正</th><th>当前不让球赔率（主胜/平/客胜）</th><th>EV（主胜/平/客胜）</th><th>Kelly%</th><th>备注</th></tr></thead><tbody>
 {''.join(row_html(row) for row in display_rows)}
 </tbody></table>
 </section>
 
 <section id="ev-board">
-<h2>赔率与 EV 筛选</h2>
+<h2>辅助：赔率与 EV 筛选</h2>
 <p>EV = 融合概率 × 当前赔率 - 1；Kelly% 使用 {kelly_label}，并受单注与总投入上限约束。</p>
 <table><thead><tr><th>编号</th><th>场次</th><th>选项</th><th>模型概率</th><th>融合概率</th><th>赔率</th><th>保本赔率</th><th>EV</th><th>Kelly%</th></tr></thead><tbody>
 {candidate_rows or '<tr><td colspan="9">当前没有正 EV 或接近正 EV 的普通胜平负选项。</td></tr>'}
@@ -1351,7 +1499,7 @@ th {{ background: #eef3f8; text-align: left; }}
 </section>
 
 <section id="ticket">
-<h2>最终建议票单</h2>
+<h2>辅助：Kelly 风控票单</h2>
 <div class="ticket">
 <p><b>主建议：单关/分散买，少串关。</b> Kelly 资金分配策略（{kelly_label}，资金量 {risk_config.get('bankroll', 10.0):.0f} 元）：共 {len(picks)} 注，合计 {stake:.2f} 元；融合概率期望返还约 {expected_return:.2f} 元，ROI 约 {roi * 100:.1f}%；整组最终赚钱概率约 {profit_probability * 100:.1f}%。</p>
 </div>
@@ -1379,7 +1527,7 @@ th {{ background: #eef3f8; text-align: left; }}
 <h2>来源</h2>
 <ul>
 <li><a href="{html.escape(odds_url)}">足彩网竞彩足球胜平负/让球赔率页</a></li>
-<li><a href="https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/scores-fixtures">FIFA 2026 World Cup scores and fixtures</a></li>
+<li><a href="{html.escape(fifa_scores_url)}">FIFA 2026 World Cup scores and fixtures</a></li>
 </ul>
 </section>
 </main>
@@ -1459,7 +1607,8 @@ def send_telegram_screenshot(env: Dict[str, str], screenshot_path: Path, generat
         "document",
         screenshot_path,
     )
-    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    api_base_url = env.get("TELEGRAM_API_BASE_URL", DEFAULT_TELEGRAM_API_BASE_URL).rstrip("/")
+    url = f"{api_base_url}/bot{token}/sendDocument"
 
     def post(opener: request.OpenerDirector) -> None:
         req = request.Request(
@@ -1515,7 +1664,10 @@ def serialize_rows(rows: List[dict], generated_at: dt.datetime, odds_url: str) -
                 "home": row.get("home", ""),
                 "away": row.get("away", ""),
                 "qtx_match_token": row.get("qtx_match_token", ""),
+                "base_probabilities": row.get("base_probabilities"),
                 "probabilities": row.get("probabilities"),
+                "ai_adjusted_probabilities": row.get("ai_adjusted_probabilities"),
+                "ai_adjustment": row.get("ai_adjustment"),
                 "market_probabilities": row.get("market_probabilities"),
                 "fused_probabilities": row.get("fused_probabilities"),
                 "normal_odds": row.get("normal_odds"),
@@ -1560,7 +1712,10 @@ def serialize_training_candidates(rows: List[dict], generated_at: dt.datetime) -
                 "group_name": "",
                 "round_text": row.get("num", ""),
                 "qtx_match_token": row.get("qtx_match_token", ""),
+                "base_probabilities": row.get("base_probabilities"),
                 "probabilities": row.get("probabilities"),
+                "ai_adjusted_probabilities": row.get("ai_adjusted_probabilities"),
+                "ai_adjustment": row.get("ai_adjustment"),
                 "normal_odds": row.get("normal_odds"),
                 "handicap_odds": row.get("handicap_odds"),
                 "home_injury_count": prematch.get("home_injury_count", 0),
@@ -1609,6 +1764,8 @@ def main() -> int:
 
     env = {**os.environ, **load_env(ROOT / args.env)}
     odds_url = env.get("ODDS_URL", DEFAULT_ODDS_URL)
+    qtx_world_cup_url = env.get("QTX_WORLD_CUP_URL", DEFAULT_QTX_WORLD_CUP_URL)
+    fifa_scores_url = env.get("FIFA_SCORES_URL", DEFAULT_FIFA_SCORES_URL)
     report_base_path = ROOT / env.get("REPORT_PATH", "docs/run/worldcup-2026-agent-report.html")
     screenshot_base_path = ROOT / env.get("REPORT_SCREENSHOT_PATH", "docs/run/worldcup-2026-agent-report.png")
 
@@ -1624,13 +1781,13 @@ def main() -> int:
     rows = parse_odds_page(page, model, score_model=score_model, risk_config=risk_config)
     qtx_enabled = args.qtx_supplement or env.get("QTX_SUPPLEMENT", "0").lower() in {"1", "true", "yes", "on"}
     if qtx_enabled:
-        qtx_rows = fetch_qtx_future_matches(model, score_model=score_model, risk_config=risk_config)
+        qtx_rows = fetch_qtx_future_matches(model, score_model=score_model, risk_config=risk_config, qtx_url=qtx_world_cup_url)
         rows = merge_candidate_rows(rows, qtx_rows)
     generated_at = dt.datetime.now()
     rows = filter_nearby_rows(rows, generated_at, days=args.days)
     if not rows:
         print("No World Cup odds rows were parsed.", file=sys.stderr)
-    report = generate_report(rows, odds_url, generated_at, risk_config=risk_config)
+    report = generate_report(rows, odds_url, generated_at, risk_config=risk_config, fifa_scores_url=fifa_scores_url)
     report_path = timestamped_path(report_base_path, generated_at)
     screenshot_path = timestamped_path(screenshot_base_path, generated_at)
     report_path.parent.mkdir(parents=True, exist_ok=True)

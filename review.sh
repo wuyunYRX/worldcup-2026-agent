@@ -10,5 +10,5 @@ else
     PYTHON="python3"
 fi
 
+"$PYTHON" scripts/fetch_latest_results.py
 "$PYTHON" scripts/review_completed_matches.py
-"$PYTHON" scripts/merge_training_candidates.py

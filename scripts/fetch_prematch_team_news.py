@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.request
 from pathlib import Path
@@ -14,12 +15,25 @@ from html import unescape
 ROOT = Path(__file__).resolve().parents[1]
 RUN_DOCS_DIR = ROOT / "docs" / "run"
 OUT_PATH = ROOT / "data" / "raw" / "prematch_team_news.json"
+DEFAULT_QTX_QINGBAO_BASE_URL = "https://live.qtx.com/qingbao"
 
 INJURY_HINTS = ("伤停", "伤病", "缺阵", "伤缺", "受伤", "复出")
 SUSPENSION_HINTS = ("停赛", "禁赛", "红牌", "黄牌停赛")
 LINEUP_HINTS = ("预计首发", "首发", "阵容")
 ROTATION_HINTS = ("轮换", "替补", "保留主力")
 MUST_WIN_HINTS = ("必须取胜", "必须赢", "背水一战", "出线", "晋级")
+
+
+def load_env(path: Path) -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    if path.exists():
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env[key.strip()] = value.strip().strip('"').strip("'")
+    return env
 
 
 def latest_snapshot() -> Path:
@@ -45,8 +59,8 @@ def html_to_text(html: str) -> str:
     return normalize(unescape(text))
 
 
-def qingbao_url(match_id: str) -> str:
-    return f"https://live.qtx.com/qingbao/{match_id}.html"
+def qingbao_url(match_id: str, base_url: str = DEFAULT_QTX_QINGBAO_BASE_URL) -> str:
+    return f"{base_url.rstrip('/')}/{match_id}.html"
 
 
 def match_id_from_snapshot_item(item: Dict[str, object]) -> str:
@@ -101,6 +115,8 @@ def analyze_qingbao(text: str, home: str, away: str) -> Dict[str, object]:
 
 
 def main() -> int:
+    env = {**os.environ, **load_env(ROOT / ".env")}
+    qingbao_base_url = env.get("QTX_QINGBAO_BASE_URL", DEFAULT_QTX_QINGBAO_BASE_URL)
     snapshot = json.loads(latest_snapshot().read_text(encoding="utf-8"))
     matches = snapshot.get("matches", [])
     results: List[Dict[str, object]] = []
@@ -131,7 +147,7 @@ def main() -> int:
         }
         if token:
             try:
-                page = fetch(qingbao_url(token))
+                page = fetch(qingbao_url(token, qingbao_base_url))
                 entry.update(analyze_qingbao(page, home, away))
             except Exception as exc:
                 entry["fetch_error"] = type(exc).__name__

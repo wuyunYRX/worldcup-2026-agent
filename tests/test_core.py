@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
+from ai_probability_adjustment import adjust_probabilities_with_ai_context  # noqa: E402
 from kelly_criterion import fractional_kelly, kelly_fraction, kelly_stake  # noqa: E402
 from probability_fusion import fuse_wdl_probabilities, normalize_triplet  # noqa: E402
 from review_completed_matches import brier, logloss, market_probs_from_odds, top1_hit, top3_hit  # noqa: E402
@@ -21,6 +22,7 @@ from worldcup_agent import (  # noqa: E402
     filter_nearby_rows,
     merge_candidate_rows,
     prioritize_primary_rows,
+    result_pick_text,
     resolve_team_name,
 )
 
@@ -41,6 +43,18 @@ class CoreMathTests(unittest.TestCase):
             {"model_weight": 0.4, "kelly_fraction": 0.2, "min_edge": 0.07, "bankroll": 500.0, "min_stake": 2.0, "max_stake_per_pick": 100.0},
         )
         self.assertAlmostEqual(ev[0], fused[0] * 1.40 - 1.0)
+
+    def test_ai_adjustment_raises_draw_when_home_rotates(self):
+        probs, meta = adjust_probabilities_with_ai_context(
+            (0.55, 0.24, 0.21),
+            {"home_rotation_flag": 1, "away_rotation_flag": 0, "home_lineup_known": 1},
+            {"enable_ai_probability_adjustment": 1.0, "ai_probability_max_delta": 0.03, "ai_probability_high_confidence_delta": 0.05},
+            (0.52, 0.26, 0.22),
+        )
+        self.assertIsNotNone(probs)
+        self.assertTrue(meta["applied"])
+        self.assertLess(probs[0], 0.55)
+        self.assertGreater(probs[1], 0.24)
 
     def test_review_metrics(self):
         probs = market_probs_from_odds([2.0, 4.0, 4.0])
@@ -65,6 +79,10 @@ class ReportFlowTests(unittest.TestCase):
         ]
         filtered = filter_nearby_rows(rows, dt.datetime(2026, 6, 22, 8, 0))
         self.assertEqual([row["home"] for row in filtered], ["A"])
+
+    def test_result_pick_uses_highest_fused_probability(self):
+        row = {"probabilities": (0.40, 0.25, 0.35), "fused_probabilities": (0.38, 0.24, 0.38)}
+        self.assertTrue(result_pick_text(row).startswith("主胜"))
 
     def test_qtx_supplement_dedupes_and_sorts_after_primary_rows(self):
         aliases = build_team_aliases({("西班牙", "沙特阿拉伯"): (0.6, 0.2, 0.2)})

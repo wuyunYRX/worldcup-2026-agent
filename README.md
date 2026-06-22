@@ -2,7 +2,7 @@
 
 一个用于 2026 美加墨世界杯的预测与竞彩足球预测 Agent。
 
-它会抓取当前可售世界杯竞彩场次赔率，结合模型胜平负概率、市场隐含概率、概率融合和 Kelly 资金管理生成结构化 HTML 报告。报告包含未来 24 小时重点比赛、小组变化、剩余可售场次概率表、赔率 EV/Kelly 筛选、保守票单建议和赛后校准结果。
+它会抓取当前可售世界杯竞彩场次赔率，结合模型胜平负概率、比分模型、市场隐含概率和赛后校准生成结构化 HTML 报告。报告优先展示未来 24 小时赛果预测、比分 Top3、进球倾向、小组变化和赛后校准；赔率 EV/Kelly 作为辅助参考。
 
 > 所有概率都是模型主观预测，不保证命中，不是官方赔率。涉及购彩请控制预算、少串关，不要把预测当确定收益。
 
@@ -16,6 +16,8 @@
   - EV = 融合概率 × 赔率 - 1
   - Kelly% 与建议投注额（含单注/总投入上限）
   - 基于比分模型的最可能比分、大小球和双方进球概率
+- 报告主线是赛果预测，EV/Kelly 只作为辅助风控信息
+- 默认开启 AI 赛前情报修正：只要存在赛前情报，就会对 WDL 概率做小幅可解释修正
 - 支持赛后复盘，输出 WDL 准确率、Brier、logloss、比分 Top1/Top3，并回填风控校准配置
 - 支持 AI 回填赛前伤停/停赛特征，优先使用 OpenAI `responses` 接口
 - 生成完整 HTML 报告和 2x 高清报告截图
@@ -66,6 +68,20 @@ open .env
 
 ```bash
 ./run.sh
+```
+
+常用网站地址统一在 `.env` 管理：
+
+```env
+ODDS_URL=https://cp.zgzcw.com/lottery/jchtplayvsForJsp.action?lotteryId=47&type=jcmini
+QTX_WORLD_CUP_URL=https://www.qtx.com/worldcup/
+QTX_QINGBAO_BASE_URL=https://live.qtx.com/qingbao
+FIFA_SCORES_URL=https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/scores-fixtures
+FOOTBALL_DATA_MATCHES_URL=https://api.football-data.org/v4/competitions/2000/matches?season=2026&status=FINISHED
+TELEGRAM_API_BASE_URL=https://api.telegram.org
+ENABLE_AI_PROBABILITY_ADJUSTMENT=1
+AI_PROBABILITY_MAX_DELTA=0.03
+AI_PROBABILITY_HIGH_CONFIDENCE_DELTA=0.05
 ```
 
 日常安全流水线（推荐用于定时任务）：
@@ -149,19 +165,21 @@ python scripts/backfill_prematch_features.py --env .env --start-index 100 --limi
 比赛结果更新后，运行：
 
 ```bash
-python scripts/review_completed_matches.py
+./review.sh
 ```
 
-脚本会扫描 `docs/run/worldcup-2026-agent-predictions_*.json` 中的赛前快照，匹配 `data/raw/wc2026_football_data_matches.json` 和历史赛果，输出：
+`review.sh` 会先尝试用 `FOOTBALL_DATA_API_TOKEN` 拉取最新已完赛赛果，写入 `data/raw/wc2026_football_data_matches.json`；如果未配置 token 或接口失败，会跳过联网更新并继续使用本地赛果文件复盘。
+
+复盘脚本会扫描 `docs/run/worldcup-2026-agent-predictions_*.json` 中的赛前快照，匹配 `data/raw/wc2026_football_data_matches.json` 和历史赛果，输出：
 
 - `docs/review/postmatch-calibration_*.json`：结构化校准结果，包括 WDL 准确率、Brier、logloss、比分 Exact/Top3。
 - `docs/review/postmatch-reflection_*.md`：可读反思报告，列出命中、偏差和下一轮调整建议。
 - `config/bayesian_calibration.json`：回填样本量和指标；样本较少且表现偏弱时，只收紧 Kelly 风控，不激进调整模型权重。
 
-便捷命令：
+如需直接运行复盘脚本而不拉取赛果：
 
 ```bash
-./review.sh
+python scripts/review_completed_matches.py
 ```
 
 ## Telegram 配置
@@ -205,12 +223,13 @@ launchctl load ~/Library/LaunchAgents/com.local.worldcup-2026-agent.plist
 HTML 报告固定包含：
 
 - `summary` 本轮摘要
-- `matches-24h` 今日/未来 24 小时重点比赛
+- `matches-24h` 今日/未来 24 小时重点预测
+- `result-predictions` 赛果预测总览
 - `group-update` 小组名次和最佳第三名变化
 - `live-postmatch` 赛前/实时/赛后更新
-- `remaining-probabilities` 当前剩余可售世界杯场次模型概率、融合概率、赔率、EV 和 Kelly%
-- `ev-board` 赔率、EV 与 Kelly 筛选
-- `ticket` 最终建议票单和建议投注额
+- `remaining-probabilities` 赔率与概率明细
+- `ev-board` 辅助赔率、EV 与 Kelly 筛选
+- `ticket` 辅助 Kelly 风控票单和建议投注额
 - `changes` 与上一版变化
 - `risks` 关键风险因素
 - `sources` 来源
