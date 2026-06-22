@@ -10,7 +10,5 @@ else
     PYTHON="python3"
 fi
 
-"$PYTHON" src/worldcup_agent.py --env .env --skip-screenshot
-"$PYTHON" scripts/map_qtx_match_tokens.py
-"$PYTHON" scripts/fetch_prematch_team_news.py
-"$PYTHON" src/worldcup_agent.py --env .env
+"$PYTHON" scripts/review_completed_matches.py
+"$PYTHON" scripts/merge_training_candidates.py

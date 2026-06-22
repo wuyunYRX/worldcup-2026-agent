@@ -1,0 +1,26 @@
+{
+  "model_weight": 0.4,
+  "kelly_fraction": 0.2,
+  "min_edge": 0.07,
+  "bankroll": 500.0,
+  "min_stake": 2.0,
+  "max_stake_per_pick": 100.0,
+  "max_total_stake": 500.0,
+  "calibration": {
+    "sample_size": 6,
+    "model_accuracy": 0.5,
+    "market_accuracy": 0.3333333333333333,
+    "fused_accuracy": 0.5,
+    "model_brier": 0.6475333333333334,
+    "market_brier": 0.8051552230735783,
+    "fused_brier": 0.6703861962671499,
+    "model_logloss": 1.0814472068542194,
+    "market_logloss": 1.200005508540904,
+    "fused_logloss": 1.095343592771165,
+    "score_exact_accuracy": 0.0,
+    "score_top3_hit_rate": 0.16666666666666666,
+    "last_review_file": "postmatch-calibration_20260622_084610.json",
+    "model_weight_decision": "sample_size_below_100_keep_current_weight",
+    "risk_adjustment_decision": "poor_short_sample_accuracy_reduce_kelly_raise_edge_keep_manual_total_stake"
+  }
+}
