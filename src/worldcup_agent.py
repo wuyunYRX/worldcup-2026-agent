@@ -592,6 +592,17 @@ def prematch_adjustments(prematch: Optional[Dict[str, object]]) -> Tuple[float, 
     if f("must_win_flag_away") >= 1:
         away_mul *= 1.06
 
+    if f("home_pressing_level") >= 0.65 and f("away_tactical_stability") <= 0.45:
+        home_mul *= 1.03
+    if f("away_pressing_level") >= 0.65 and f("home_tactical_stability") <= 0.45:
+        away_mul *= 1.03
+    if f("home_defensive_line") >= 0.62 and f("away_coach_style_counter") >= 1:
+        home_mul *= 0.97
+        away_mul *= 1.02
+    if f("away_defensive_line") >= 0.62 and f("home_coach_style_counter") >= 1:
+        away_mul *= 0.97
+        home_mul *= 1.02
+
     metadata = {
         "home_injury_count": f("home_injury_count"),
         "away_injury_count": f("away_injury_count"),
@@ -603,6 +614,20 @@ def prematch_adjustments(prematch: Optional[Dict[str, object]]) -> Tuple[float, 
         "must_win_flag_away": f("must_win_flag_away"),
         "home_lineup_known": f("home_lineup_known"),
         "away_lineup_known": f("away_lineup_known"),
+        "home_pressing_level": f("home_pressing_level"),
+        "away_pressing_level": f("away_pressing_level"),
+        "home_defensive_line": f("home_defensive_line"),
+        "away_defensive_line": f("away_defensive_line"),
+        "home_tactical_stability": f("home_tactical_stability"),
+        "away_tactical_stability": f("away_tactical_stability"),
+        "home_transition_risk": f("home_transition_risk"),
+        "away_transition_risk": f("away_transition_risk"),
+        "tactical_mismatch_home": f("tactical_mismatch_home"),
+        "tactical_mismatch_away": f("tactical_mismatch_away"),
+        "home_coach_style_counter": f("home_coach_style_counter"),
+        "away_coach_style_counter": f("away_coach_style_counter"),
+        "tactical_summary": prematch.get("tactical_summary", "") if prematch else "",
+        "tactical_source": prematch.get("tactical_source", "") if prematch else "",
     }
     return home_mul, away_mul, metadata
 
@@ -668,6 +693,18 @@ def score_prediction_from_trained_model(
         "away_rotation_flag": 0.0,
         "must_win_flag_home": 0.0,
         "must_win_flag_away": 0.0,
+        "home_pressing_level": 0.0,
+        "away_pressing_level": 0.0,
+        "home_defensive_line": 0.5,
+        "away_defensive_line": 0.5,
+        "home_tactical_stability": 0.5,
+        "away_tactical_stability": 0.5,
+        "home_transition_risk": 0.3,
+        "away_transition_risk": 0.3,
+        "tactical_mismatch_home": 0.0,
+        "tactical_mismatch_away": 0.0,
+        "home_coach_style_counter": 0.0,
+        "away_coach_style_counter": 0.0,
         "home_recent_goals_for": 0.0,
         "home_recent_goals_against": 0.0,
         "away_recent_goals_for": 0.0,
@@ -694,6 +731,18 @@ def score_prediction_from_trained_model(
             feature_map["away_rotation_flag"] = prematch_float(prematch, "away_rotation_flag")
             feature_map["must_win_flag_home"] = prematch_float(prematch, "must_win_flag_home")
             feature_map["must_win_flag_away"] = prematch_float(prematch, "must_win_flag_away")
+            feature_map["home_pressing_level"] = prematch_float(prematch, "home_pressing_level")
+            feature_map["away_pressing_level"] = prematch_float(prematch, "away_pressing_level")
+            feature_map["home_defensive_line"] = prematch_float(prematch, "home_defensive_line")
+            feature_map["away_defensive_line"] = prematch_float(prematch, "away_defensive_line")
+            feature_map["home_tactical_stability"] = prematch_float(prematch, "home_tactical_stability")
+            feature_map["away_tactical_stability"] = prematch_float(prematch, "away_tactical_stability")
+            feature_map["home_transition_risk"] = prematch_float(prematch, "home_transition_risk")
+            feature_map["away_transition_risk"] = prematch_float(prematch, "away_transition_risk")
+            feature_map["tactical_mismatch_home"] = prematch_float(prematch, "tactical_mismatch_home")
+            feature_map["tactical_mismatch_away"] = prematch_float(prematch, "tactical_mismatch_away")
+            feature_map["home_coach_style_counter"] = 1.0 if str(prematch.get("home_coach_style", "")) == "counter" else 0.0
+            feature_map["away_coach_style_counter"] = 1.0 if str(prematch.get("away_coach_style", "")) == "counter" else 0.0
     features = [float(feature_map.get(name, 0.0)) for name in feature_names]
     lambda_home = clamp_exp(dot(features, home_weights))
     lambda_away = clamp_exp(dot(features, away_weights))
@@ -887,6 +936,8 @@ def parse_odds_page(
                 "base_probabilities": base_probs,
                 "probabilities": probs,
                 "ai_adjusted_probabilities": probs,
+                "context_adjusted_probabilities": (ai_adjustment.get("context_adjusted_probabilities") or probs),
+                "tactical_adjusted_probabilities": probs if ai_adjustment.get("applied_tactical") else None,
                 "ai_adjustment": ai_adjustment,
                 "market_probabilities": market_probs,
                 "fused_probabilities": fused_probs,
@@ -976,6 +1027,8 @@ def fetch_qtx_future_matches(
                         "base_probabilities": base_probs,
                         "probabilities": probs,
                         "ai_adjusted_probabilities": probs,
+                        "context_adjusted_probabilities": (ai_adjustment.get("context_adjusted_probabilities") or probs),
+                        "tactical_adjusted_probabilities": probs if ai_adjustment.get("applied_tactical") else None,
                         "ai_adjustment": ai_adjustment,
                         "market_probabilities": market_probs,
                         "fused_probabilities": fused_probs,
@@ -1213,8 +1266,10 @@ def result_reason_text(row: dict) -> str:
     idx, probability, margin = predicted_outcome(row)
     market = row.get("market_probabilities") or (0.0, 0.0, 0.0)
     model = row.get("probabilities") or (0.0, 0.0, 0.0)
+    tactical = ((row.get("score_prediction") or {}).get("prematch_adjustments") or {}).get("tactical_summary", "")
     market_hint = "赔率未开，主要看模型" if not any(market) else f"市场去水 {pct(market[idx], 1)}，模型 {pct(model[idx], 1)}"
-    return f"领先第二方向 {pct(margin, 1)}；{market_hint}"
+    tactical_hint = f"；战术：{tactical}" if tactical else ""
+    return f"领先第二方向 {pct(margin, 1)}；{market_hint}{tactical_hint}"
 
 
 def ai_adjustment_summary(row: dict) -> str:
@@ -1227,9 +1282,11 @@ def ai_adjustment_summary(row: dict) -> str:
     delta = adjustment.get("delta") or [0.0, 0.0, 0.0]
     reasons = adjustment.get("reasons") or []
     confidence = str(adjustment.get("confidence", "low"))
+    tactical = ((row.get("score_prediction") or {}).get("prematch_adjustments") or {}).get("tactical_summary", "")
     delta_text = " / ".join(f"{OUTCOME_NAMES[idx]} {delta[idx] * 100:+.1f}%" for idx in range(min(3, len(delta))))
     reason_text = "、".join(str(item) for item in reasons[:3]) if reasons else "赛前情报修正"
-    return f"{delta_text}；置信度 {confidence}；{reason_text}"
+    tactical_text = f"；{tactical}" if tactical else ""
+    return f"{delta_text}；置信度 {confidence}；{reason_text}{tactical_text}"
 
 
 def ticket_metrics(picks: List[Tuple[dict, int]], stake_per_pick: float = 2.0) -> Tuple[float, float, float, float]:
@@ -1667,6 +1724,8 @@ def serialize_rows(rows: List[dict], generated_at: dt.datetime, odds_url: str) -
                 "base_probabilities": row.get("base_probabilities"),
                 "probabilities": row.get("probabilities"),
                 "ai_adjusted_probabilities": row.get("ai_adjusted_probabilities"),
+                "context_adjusted_probabilities": row.get("context_adjusted_probabilities"),
+                "tactical_adjusted_probabilities": row.get("tactical_adjusted_probabilities"),
                 "ai_adjustment": row.get("ai_adjustment"),
                 "market_probabilities": row.get("market_probabilities"),
                 "fused_probabilities": row.get("fused_probabilities"),
@@ -1715,6 +1774,8 @@ def serialize_training_candidates(rows: List[dict], generated_at: dt.datetime) -
                 "base_probabilities": row.get("base_probabilities"),
                 "probabilities": row.get("probabilities"),
                 "ai_adjusted_probabilities": row.get("ai_adjusted_probabilities"),
+                "context_adjusted_probabilities": row.get("context_adjusted_probabilities"),
+                "tactical_adjusted_probabilities": row.get("tactical_adjusted_probabilities"),
                 "ai_adjustment": row.get("ai_adjustment"),
                 "normal_odds": row.get("normal_odds"),
                 "handicap_odds": row.get("handicap_odds"),

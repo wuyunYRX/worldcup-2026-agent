@@ -56,6 +56,17 @@ class CoreMathTests(unittest.TestCase):
         self.assertLess(probs[0], 0.55)
         self.assertGreater(probs[1], 0.24)
 
+    def test_ai_adjustment_lifts_counter_team_against_high_line(self):
+        probs, meta = adjust_probabilities_with_ai_context(
+            (0.52, 0.24, 0.24),
+            {"home_defensive_line": 0.7, "away_coach_style": "counter", "home_lineup_known": 1, "away_lineup_known": 1},
+            {"enable_ai_probability_adjustment": 1.0, "ai_probability_max_delta": 0.03, "ai_probability_high_confidence_delta": 0.05},
+            (0.58, 0.22, 0.20),
+        )
+        self.assertIsNotNone(probs)
+        self.assertTrue(meta["applied"])
+        self.assertGreater(probs[2], 0.24)
+
     def test_review_metrics(self):
         probs = market_probs_from_odds([2.0, 4.0, 4.0])
         self.assertIsNotNone(probs)

@@ -45,6 +45,8 @@ def adjust_probabilities_with_ai_context(
     home, draw, away = probabilities
     adjusted = [home, draw, away]
     reasons: List[str] = []
+    context_reasons: List[str] = []
+    tactical_reasons: List[str] = []
     signal_strength = 0.0
 
     home_injury = _f(prematch, "home_injury_count")
@@ -56,6 +58,16 @@ def adjust_probabilities_with_ai_context(
     must_win_home = _f(prematch, "must_win_flag_home")
     must_win_away = _f(prematch, "must_win_flag_away")
     lineup_known = _f(prematch, "home_lineup_known") + _f(prematch, "away_lineup_known")
+    home_pressing = _f(prematch, "home_pressing_level")
+    away_pressing = _f(prematch, "away_pressing_level")
+    home_line = _f(prematch, "home_defensive_line")
+    away_line = _f(prematch, "away_defensive_line")
+    home_stability = _f(prematch, "home_tactical_stability")
+    away_stability = _f(prematch, "away_tactical_stability")
+    mismatch_home = _f(prematch, "tactical_mismatch_home")
+    mismatch_away = _f(prematch, "tactical_mismatch_away")
+    home_style = str(prematch.get("home_coach_style", "")) if prematch else ""
+    away_style = str(prematch.get("away_coach_style", "")) if prematch else ""
 
     if home_injury > away_injury:
         delta = min(max_delta, 0.008 * (home_injury - away_injury))
@@ -63,6 +75,7 @@ def adjust_probabilities_with_ai_context(
         adjusted[1] += delta * 0.6
         adjusted[2] += delta * 0.4
         reasons.append("主队伤停更多")
+        context_reasons.append("主队伤停更多")
         signal_strength += delta
     elif away_injury > home_injury:
         delta = min(max_delta, 0.008 * (away_injury - home_injury))
@@ -70,6 +83,7 @@ def adjust_probabilities_with_ai_context(
         adjusted[1] += delta * 0.6
         adjusted[0] += delta * 0.4
         reasons.append("客队伤停更多")
+        context_reasons.append("客队伤停更多")
         signal_strength += delta
 
     if home_suspend > away_suspend:
@@ -78,6 +92,7 @@ def adjust_probabilities_with_ai_context(
         adjusted[1] += delta * 0.5
         adjusted[2] += delta * 0.5
         reasons.append("主队停赛影响更大")
+        context_reasons.append("主队停赛影响更大")
         signal_strength += delta
     elif away_suspend > home_suspend:
         delta = min(max_delta, 0.01 * (away_suspend - home_suspend))
@@ -85,6 +100,7 @@ def adjust_probabilities_with_ai_context(
         adjusted[1] += delta * 0.5
         adjusted[0] += delta * 0.5
         reasons.append("客队停赛影响更大")
+        context_reasons.append("客队停赛影响更大")
         signal_strength += delta
 
     if home_rotation >= 1 and away_rotation < 1:
@@ -93,6 +109,7 @@ def adjust_probabilities_with_ai_context(
         adjusted[1] += delta * 0.65
         adjusted[2] += delta * 0.35
         reasons.append("主队轮换风险")
+        context_reasons.append("主队轮换风险")
         signal_strength += delta
     elif away_rotation >= 1 and home_rotation < 1:
         delta = min(max_delta, 0.02)
@@ -100,6 +117,7 @@ def adjust_probabilities_with_ai_context(
         adjusted[1] += delta * 0.65
         adjusted[0] += delta * 0.35
         reasons.append("客队轮换风险")
+        context_reasons.append("客队轮换风险")
         signal_strength += delta
     elif away_rotation >= 1 and home_rotation >= 1:
         delta = min(max_delta, 0.015)
@@ -107,6 +125,7 @@ def adjust_probabilities_with_ai_context(
         adjusted[2] -= delta * 0.5
         adjusted[1] += delta
         reasons.append("双方都有轮换风险")
+        context_reasons.append("双方都有轮换风险")
         signal_strength += delta
 
     if must_win_home >= 1 and must_win_away < 1:
@@ -115,6 +134,7 @@ def adjust_probabilities_with_ai_context(
         adjusted[1] -= delta * 0.7
         adjusted[2] -= delta * 0.3
         reasons.append("主队战意更强")
+        context_reasons.append("主队战意更强")
         signal_strength += delta
     elif must_win_away >= 1 and must_win_home < 1:
         delta = min(max_delta, 0.018)
@@ -122,11 +142,77 @@ def adjust_probabilities_with_ai_context(
         adjusted[1] -= delta * 0.7
         adjusted[0] -= delta * 0.3
         reasons.append("客队战意更强")
+        context_reasons.append("客队战意更强")
         signal_strength += delta
 
     if market_probabilities and abs(probabilities[0] - market_probabilities[0]) >= 0.12 and lineup_known >= 1:
         reasons.append("赛前情报可用于修正模型与市场分歧")
         signal_strength += 0.005
+
+    context_adjusted = _normalize((adjusted[0], adjusted[1], adjusted[2]))
+    adjusted = list(context_adjusted)
+
+    if home_style == "possession" and away_style == "low_block":
+        delta = min(max_delta, 0.012)
+        adjusted[1] += delta
+        adjusted[0] -= delta * 0.6
+        adjusted[2] -= delta * 0.4
+        reasons.append("主队控球遇客队低位防守")
+        tactical_reasons.append("主队控球遇客队低位防守")
+        signal_strength += delta
+
+    if away_style == "counter" and home_line >= 0.62:
+        delta = min(max_delta, 0.014)
+        adjusted[2] += delta
+        adjusted[0] -= delta * 0.6
+        adjusted[1] -= delta * 0.4
+        reasons.append("主队高防线遇客队反击")
+        tactical_reasons.append("主队高防线遇客队反击")
+        signal_strength += delta
+
+    if home_style == "counter" and away_line >= 0.62:
+        delta = min(max_delta, 0.014)
+        adjusted[0] += delta
+        adjusted[2] -= delta * 0.6
+        adjusted[1] -= delta * 0.4
+        reasons.append("客队高防线遇主队反击")
+        tactical_reasons.append("客队高防线遇主队反击")
+        signal_strength += delta
+
+    if home_pressing >= 0.65 and away_stability <= 0.45:
+        delta = min(max_delta, 0.012)
+        adjusted[0] += delta
+        adjusted[1] -= delta * 0.5
+        adjusted[2] -= delta * 0.5
+        reasons.append("主队高压针对客队体系不稳")
+        tactical_reasons.append("主队高压针对客队体系不稳")
+        signal_strength += delta
+
+    if away_pressing >= 0.65 and home_stability <= 0.45:
+        delta = min(max_delta, 0.012)
+        adjusted[2] += delta
+        adjusted[1] -= delta * 0.5
+        adjusted[0] -= delta * 0.5
+        reasons.append("客队高压针对主队体系不稳")
+        tactical_reasons.append("客队高压针对主队体系不稳")
+        signal_strength += delta
+
+    if mismatch_home > 0:
+        delta = min(max_delta, 0.015 * mismatch_home)
+        adjusted[0] += delta
+        adjusted[1] -= delta * 0.6
+        adjusted[2] -= delta * 0.4
+        reasons.append("主队战术克制更有利")
+        tactical_reasons.append("主队战术克制更有利")
+        signal_strength += delta
+    if mismatch_away > 0:
+        delta = min(max_delta, 0.015 * mismatch_away)
+        adjusted[2] += delta
+        adjusted[1] -= delta * 0.6
+        adjusted[0] -= delta * 0.4
+        reasons.append("客队战术克制更有利")
+        tactical_reasons.append("客队战术克制更有利")
+        signal_strength += delta
 
     if not reasons:
         return probabilities, {"enabled": True, "applied": False, "reason": "no_material_signal"}
@@ -145,8 +231,12 @@ def adjust_probabilities_with_ai_context(
         "enabled": True,
         "applied": True,
         "base_probabilities": list(probabilities),
+        "context_adjusted_probabilities": list(context_adjusted),
         "adjusted_probabilities": list(normalized),
         "delta": final_deltas,
         "reasons": reasons,
+        "context_reasons": context_reasons,
+        "tactical_reasons": tactical_reasons,
+        "applied_tactical": bool(tactical_reasons),
         "confidence": confidence,
     }
