@@ -35,9 +35,14 @@ from worldcup_agent import (  # noqa: E402
     merge_candidate_rows,
     parse_asian_handicap_source,
     parse_zgzcw_ypdb_market,
+    parse_total_goals_source,
+    parse_zgzcw_dxdb_market,
     prioritize_primary_rows,
     result_pick_text,
     resolve_team_name,
+    total_goals_probabilities_from_score_grid,
+    total_goals_return_units,
+    total_goals_value_metrics,
 )
 
 
@@ -208,6 +213,69 @@ class ReportFlowTests(unittest.TestCase):
         self.assertIsNotNone(market)
         self.assertEqual(market["line"], -1.25)
         self.assertEqual(market["odds"], [1.99, 1.88])
+
+    def test_total_goals_quarter_line_settlement(self):
+        self.assertEqual(total_goals_return_units(1, 1, 2.25), -0.5)
+        self.assertEqual(total_goals_return_units(2, 1, 2.75), 0.5)
+        self.assertEqual(total_goals_return_units(1, 1, 2.0), 0.0)
+        self.assertEqual(total_goals_return_units(3, 0, 2.5), 1.0)
+
+    def test_total_goals_probabilities_and_value_metrics(self):
+        grid = [(2, 1, 0.4), (1, 1, 0.2), (1, 0, 0.2), (0, 0, 0.2)]
+        probs = total_goals_probabilities_from_score_grid(grid, 2.5)
+        self.assertIsNotNone(probs)
+        self.assertAlmostEqual(probs["over_full_win"], 0.4)
+        self.assertAlmostEqual(probs["over_full_loss"], 0.6)
+        total_probs, market_probs, ev, kelly = total_goals_value_metrics(
+            grid,
+            2.5,
+            [1.90, 1.95],
+            {"kelly_fraction": 0.25, "min_edge": 0.01},
+        )
+        self.assertIsNotNone(total_probs)
+        self.assertAlmostEqual(sum(market_probs), 1.0)
+        self.assertEqual(len(ev), 2)
+        self.assertEqual(len(kelly), 2)
+
+    def test_parse_total_goals_json_source(self):
+        aliases = build_team_aliases({("阿根廷", "奥地利"): (0.6, 0.2, 0.2)})
+        text = json.dumps(
+            {
+                "markets": [
+                    {
+                        "match_time": "2026-06-23 01:00",
+                        "home": "阿根廷",
+                        "away": "奥地利",
+                        "line": 2.75,
+                        "over_odds": 1.92,
+                        "under_odds": 1.88,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        markets = parse_total_goals_source(text, aliases, "unit-test")
+        key = ("2026-06-23 01:00", "阿根廷", "奥地利")
+        self.assertIn(key, markets)
+        self.assertEqual(markets[key]["line"], 2.75)
+        self.assertEqual(markets[key]["odds"], [1.92, 1.88])
+
+    def test_parse_zgzcw_dxdb_average_market(self):
+        html_text = """
+        <tr>
+          <td>平均*</td>
+          <td id="chupan-w-0" data="0.96">0.96</td>
+          <td id="chupan-s-0" data='2.5'>2.5球</td>
+          <td id="chupan-l-0" data="0.86">0.86</td>
+          <td cid="0" data="0.88"><a>0.88</a></td>
+          <td cid="0" data='2.50'><a>2.5球</a></td>
+          <td cid="0" data="0.94"><a>0.94</a></td>
+        </tr>
+        """
+        market = parse_zgzcw_dxdb_market(html_text)
+        self.assertIsNotNone(market)
+        self.assertEqual(market["line"], 2.5)
+        self.assertEqual(market["odds"], [1.88, 1.94])
 
     def test_qtx_supplement_dedupes_and_sorts_after_primary_rows(self):
         aliases = build_team_aliases({("西班牙", "沙特阿拉伯"): (0.6, 0.2, 0.2)})

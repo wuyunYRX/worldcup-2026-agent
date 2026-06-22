@@ -37,6 +37,7 @@ DEFAULT_QTX_WORLD_CUP_URL = "https://www.qtx.com/worldcup/"
 DEFAULT_FIFA_SCORES_URL = "https://www.fifa.com/en/tournaments/mens/worldcup/canadamexicousa2026/scores-fixtures"
 DEFAULT_TELEGRAM_API_BASE_URL = "https://api.telegram.org"
 DEFAULT_ASIAN_HANDICAP_PATH = ROOT / "data" / "raw" / "asian_handicap_markets.json"
+DEFAULT_TOTAL_GOALS_PATH = ROOT / "data" / "raw" / "total_goals_markets.json"
 WC2026_RESULTS_PATH = ROOT / "data" / "raw" / "wc2026_football_data_matches.json"
 OUTCOME_NAMES = ["主胜", "平", "客胜"]
 DRAW_PROBABILITY_FLOOR = 0.22
@@ -307,6 +308,113 @@ def fetch_zgzcw_ypdb_market(play_id: str) -> Optional[dict]:
         print(f"Zgzcw asian handicap skipped for {play_id}: {exc}", file=sys.stderr)
         return None
     market = parse_zgzcw_ypdb_market(text)
+    if market:
+        market["source"] = url
+    return market
+
+
+def normalize_total_goals_record(row: Dict[str, object], aliases: Dict[str, str]) -> Optional[dict]:
+    home_raw = first_value(row, ("home", "home_team", "host", "主队"))
+    away_raw = first_value(row, ("away", "away_team", "guest", "客队"))
+    if not home_raw or not away_raw:
+        return None
+    line = parse_optional_handicap_line(first_value(row, ("total_goals_line", "line", "goal_line", "大小球", "盘口")))
+    if line is None:
+        return None
+    over_odds = as_float(first_value(row, ("over_odds", "over_water", "大球水位", "大水")))
+    under_odds = as_float(first_value(row, ("under_odds", "under_water", "小球水位", "小水")))
+    if over_odds <= 1.0 or under_odds <= 1.0:
+        return None
+    return {
+        "match_time": normalize_text(str(first_value(row, ("match_time", "time", "kickoff", "比赛时间")))),
+        "home": resolve_team_name(str(home_raw), aliases),
+        "away": resolve_team_name(str(away_raw), aliases),
+        "line": line,
+        "odds": [over_odds, under_odds],
+    }
+
+
+def parse_total_goals_source(text: str, aliases: Dict[str, str], source: str = "") -> Dict[Tuple[str, str, str], dict]:
+    records: List[Dict[str, object]] = []
+    stripped = text.strip()
+    if not stripped:
+        return {}
+    if stripped.startswith(("[", "{")):
+        raw = json.loads(stripped)
+        if isinstance(raw, dict):
+            raw_records = raw.get("matches") or raw.get("markets") or raw.get("data") or []
+        else:
+            raw_records = raw
+        if isinstance(raw_records, list):
+            records = [item for item in raw_records if isinstance(item, dict)]
+    else:
+        records = [dict(row) for row in csv.DictReader(stripped.splitlines())]
+
+    markets: Dict[Tuple[str, str, str], dict] = {}
+    for record in records:
+        market = normalize_total_goals_record(record, aliases)
+        if not market:
+            continue
+        key = (market["match_time"], normalize_text(market["home"]), normalize_text(market["away"]))
+        markets[key] = {**market, "source": source}
+        fallback_key = ("", normalize_text(market["home"]), normalize_text(market["away"]))
+        markets.setdefault(fallback_key, {**market, "source": source})
+    return markets
+
+
+def load_total_goals_markets(source: str, aliases: Dict[str, str]) -> Dict[Tuple[str, str, str], dict]:
+    if not source:
+        return {}
+    try:
+        text = read_text_source(source)
+        return parse_total_goals_source(text, aliases, source)
+    except Exception as exc:
+        print(f"Total goals market source skipped: {exc}", file=sys.stderr)
+        return {}
+
+
+def total_goals_market_for_row(row: dict, markets: Dict[Tuple[str, str, str], dict]) -> Optional[dict]:
+    key = (normalize_text(str(row.get("match_time", ""))), normalize_text(str(row.get("home", ""))), normalize_text(str(row.get("away", ""))))
+    if key in markets:
+        return markets[key]
+    return markets.get(("", key[1], key[2]))
+
+
+def parse_zgzcw_dxdb_market(text: str) -> Optional[dict]:
+    pos = text.find('id="chupan-w-0"')
+    if pos < 0:
+        pos = text.find("id='chupan-w-0'")
+    if pos < 0:
+        return None
+    start = text.rfind("<tr", 0, pos)
+    end = text.find("</tr>", pos)
+    if start < 0 or end < 0:
+        return None
+    row = text[start:end + 5]
+    data_values = [as_float(value, -999.0) for value in re.findall(r"\bdata\s*=\s*[\"']([^\"']*)[\"']", row)]
+    numeric_values = [value for value in data_values if value > -999.0]
+    if len(numeric_values) < 6:
+        return None
+    current_over_water, line, current_under_water = numeric_values[3], numeric_values[4], numeric_values[5]
+    over_odds = asian_decimal_odds_from_water(current_over_water)
+    under_odds = asian_decimal_odds_from_water(current_under_water)
+    if line <= 0 or over_odds <= 1.0 or under_odds <= 1.0:
+        return None
+    return {"line": line, "odds": [over_odds, under_odds]}
+
+
+def fetch_zgzcw_dxdb_market(play_id: str) -> Optional[dict]:
+    if not play_id:
+        return None
+    url = f"https://fenxi.zgzcw.com/{play_id}/dxdb"
+    try:
+        req = request.Request(url, headers={"User-Agent": "Mozilla/5.0 WorldCupAgent/1.0", "Referer": DEFAULT_ODDS_URL})
+        with request.urlopen(req, timeout=20) as resp:
+            text = decode_page_bytes(resp.read())
+    except Exception as exc:
+        print(f"Zgzcw total goals skipped for {play_id}: {exc}", file=sys.stderr)
+        return None
+    market = parse_zgzcw_dxdb_market(text)
     if market:
         market["source"] = url
     return market
@@ -676,6 +784,91 @@ def asian_handicap_value_metrics(
     return probabilities, market_probabilities, ev, kelly_fractions
 
 
+def total_goals_return_units(home_goals: int, away_goals: int, line: float) -> float:
+    total_goals = home_goals + away_goals
+    returns = []
+    for part_line in split_asian_handicap_line(line):
+        if total_goals > part_line:
+            returns.append(1.0)
+        elif total_goals == part_line:
+            returns.append(0.0)
+        else:
+            returns.append(-1.0)
+    return sum(returns) / len(returns)
+
+
+def total_goals_probabilities_from_score_grid(
+    grid: List[Tuple[int, int, float]],
+    line: float,
+) -> Optional[Dict[str, float]]:
+    if not grid:
+        return None
+    result = {
+        "over_full_win": 0.0,
+        "over_half_win": 0.0,
+        "push": 0.0,
+        "over_half_loss": 0.0,
+        "over_full_loss": 0.0,
+    }
+    for home_goals, away_goals, prob in grid:
+        units = total_goals_return_units(home_goals, away_goals, line)
+        if units >= 1.0:
+            result["over_full_win"] += prob
+        elif units > 0.0:
+            result["over_half_win"] += prob
+        elif units == 0.0:
+            result["push"] += prob
+        elif units > -1.0:
+            result["over_half_loss"] += prob
+        else:
+            result["over_full_loss"] += prob
+    total = sum(result.values())
+    if total <= 0:
+        return None
+    return {key: value / total for key, value in result.items()}
+
+
+def total_goals_market_probabilities_from_odds(odds: List[float]) -> Tuple[float, float]:
+    return asian_market_probabilities_from_odds(odds)
+
+
+def total_goals_value_metrics(
+    grid: Optional[List[Tuple[int, int, float]]],
+    line: Optional[float],
+    odds: List[float],
+    risk_config: Dict[str, float],
+) -> Tuple[Optional[Dict[str, float]], Tuple[float, float], List[Optional[float]], List[float]]:
+    if not grid or line is None:
+        return None, total_goals_market_probabilities_from_odds(odds), [None, None], [0.0, 0.0]
+    probabilities = total_goals_probabilities_from_score_grid(grid, line)
+    market_probabilities = total_goals_market_probabilities_from_odds(odds)
+    ev: List[Optional[float]] = [None, None]
+    kelly_fractions = [0.0, 0.0]
+    for idx in range(2):
+        if idx >= len(odds) or odds[idx] <= 1.0:
+            continue
+        direction = 1.0 if idx == 0 else -1.0
+        expected_profit = 0.0
+        positive_units = 0.0
+        negative_units = 0.0
+        for home_goals, away_goals, prob in grid:
+            units = total_goals_return_units(home_goals, away_goals, line) * direction
+            expected_profit += prob * asian_profit_for_units(units, odds[idx])
+            if units > 0:
+                positive_units += prob * units
+            elif units < 0:
+                negative_units += prob * abs(units)
+        ev[idx] = expected_profit
+        effective_probability = positive_units / (positive_units + negative_units) if positive_units + negative_units > 0 else 0.0
+        kelly_fractions[idx] = fractional_kelly(
+            effective_probability,
+            odds[idx],
+            risk_config.get("kelly_fraction", 0.25),
+            risk_config.get("min_edge", 0.05),
+        )
+    return probabilities, market_probabilities, ev, kelly_fractions
+
+
 def rerank_score_grid(
     grid: List[Tuple[int, int, float]],
     lambda_home: float,
@@ -688,6 +881,8 @@ def rerank_score_grid(
     handicap_market_probabilities: Optional[Tuple[float, float, float]] = None,
     asian_handicap_line: Optional[float] = None,
     asian_market_probabilities: Optional[Tuple[float, float]] = None,
+    total_goals_line: Optional[float] = None,
+    total_goals_market_probabilities: Optional[Tuple[float, float]] = None,
 ) -> List[Tuple[int, int, float]]:
     total_goals = lambda_home + lambda_away
     goal_diff = lambda_home - lambda_away
@@ -740,6 +935,15 @@ def rerank_score_grid(
                 weight *= 0.92 + asian_away * 0.35
             else:
                 weight *= 1.02
+        if total_goals_line is not None and total_goals_market_probabilities:
+            over_prob, under_prob = total_goals_market_probabilities
+            total_return = total_goals_return_units(home_goals, away_goals, total_goals_line)
+            if total_return > 0:
+                weight *= 0.90 + over_prob * 0.42
+            elif total_return < 0:
+                weight *= 0.90 + under_prob * 0.42
+            else:
+                weight *= 1.02
         if goal_diff >= 0.45 and home_goals > away_goals:
             weight *= 1.06
         if goal_diff <= -0.45 and away_goals > home_goals:
@@ -758,6 +962,8 @@ def score_prediction_from_wdl(
     handicap_market_probabilities: Optional[Tuple[float, float, float]] = None,
     asian_handicap_line: Optional[float] = None,
     asian_market_probabilities: Optional[Tuple[float, float]] = None,
+    total_goals_line: Optional[float] = None,
+    total_goals_market_probabilities: Optional[Tuple[float, float]] = None,
 ) -> dict:
     """Infer a simple Poisson score model from W/D/L probabilities.
 
@@ -802,6 +1008,8 @@ def score_prediction_from_wdl(
         handicap_market_probabilities,
         asian_handicap_line,
         asian_market_probabilities,
+        total_goals_line,
+        total_goals_market_probabilities,
     )
     top_scores = sorted(grid, key=lambda item: item[2], reverse=True)[:3]
     over_25 = sum(prob for home_goals, away_goals, prob in grid if home_goals + away_goals >= 3)
@@ -1056,6 +1264,8 @@ def score_prediction_from_trained_model(
     handicap_market_probabilities: Optional[Tuple[float, float, float]] = None,
     asian_handicap_line: Optional[float] = None,
     asian_market_probabilities: Optional[Tuple[float, float]] = None,
+    total_goals_line: Optional[float] = None,
+    total_goals_market_probabilities: Optional[Tuple[float, float]] = None,
 ) -> Optional[dict]:
     if not score_model:
         return None
@@ -1198,6 +1408,8 @@ def score_prediction_from_trained_model(
         handicap_market_probabilities,
         asian_handicap_line,
         asian_market_probabilities,
+        total_goals_line,
+        total_goals_market_probabilities,
     )
     top_scores = sorted(grid, key=lambda item: item[2], reverse=True)[:3]
     over_25 = sum(prob for home_goals, away_goals, prob in grid if home_goals + away_goals >= 3)
@@ -1307,7 +1519,9 @@ def parse_odds_page(
     score_model: Optional[Dict[str, object]] = None,
     risk_config: Optional[Dict[str, float]] = None,
     asian_markets: Optional[Dict[Tuple[str, str, str], dict]] = None,
+    total_goals_markets: Optional[Dict[Tuple[str, str, str], dict]] = None,
     enable_zgzcw_asian: bool = False,
+    enable_zgzcw_total_goals: bool = False,
 ) -> List[dict]:
     risk_config = risk_config or dict(DEFAULT_RISK_CONFIG)
     aliases = build_team_aliases(model)
@@ -1362,6 +1576,21 @@ def parse_odds_page(
             asian_handicap_odds = list(external_asian_market["odds"])
         asian_market_preview = asian_market_probabilities_from_odds(asian_handicap_odds)
         asian_market_for_score = asian_market_preview if sum(asian_market_preview) > 0 else None
+        total_goals_line = None
+        total_goals_odds = [0.0, 0.0]
+        external_total_goals_market = total_goals_market_for_row(
+            {"match_time": match_time, "home": home, "away": away},
+            total_goals_markets or {},
+        )
+        play_id_match = None
+        if external_total_goals_market is None and enable_zgzcw_total_goals:
+            play_id_match = re.search(r'newPlayid="?(\d+)"?', block, flags=re.I)
+            external_total_goals_market = fetch_zgzcw_dxdb_market(play_id_match.group(1) if play_id_match else "")
+        if external_total_goals_market:
+            total_goals_line = float(external_total_goals_market["line"])
+            total_goals_odds = list(external_total_goals_market["odds"])
+        total_goals_market_preview = total_goals_market_probabilities_from_odds(total_goals_odds)
+        total_goals_market_for_score = total_goals_market_preview if sum(total_goals_market_preview) > 0 else None
         base_probs = probs
         market_preview = market_probabilities_from_odds(normal_odds, probs)
         ai_probs, ai_adjustment = adjust_probabilities_with_ai_context(probs, prematch, risk_config, market_preview)
@@ -1385,6 +1614,8 @@ def parse_odds_page(
             handicap_market_probabilities=handicap_market_for_score,
             asian_handicap_line=asian_handicap_line,
             asian_market_probabilities=asian_market_for_score,
+            total_goals_line=total_goals_line,
+            total_goals_market_probabilities=total_goals_market_for_score,
         )
         score_prediction = trained_prediction or (
             score_prediction_from_wdl(
@@ -1393,6 +1624,8 @@ def parse_odds_page(
                 handicap_market_for_score,
                 asian_handicap_line,
                 asian_market_for_score,
+                total_goals_line,
+                total_goals_market_for_score,
             )
             if probs
             else None
@@ -1404,6 +1637,12 @@ def parse_odds_page(
             score_grid_rows,
             asian_handicap_line,
             asian_handicap_odds,
+            risk_config,
+        )
+        total_goals_probs, total_goals_market_probs, total_goals_ev, total_goals_kelly_fractions = total_goals_value_metrics(
+            score_grid_rows,
+            total_goals_line,
+            total_goals_odds,
             risk_config,
         )
 
@@ -1435,6 +1674,13 @@ def parse_odds_page(
                 "asian_handicap_ev": asian_ev,
                 "asian_handicap_kelly_fractions": asian_kelly_fractions,
                 "asian_handicap_source": (external_asian_market or {}).get("source", ""),
+                "total_goals_line": total_goals_line,
+                "total_goals_odds": total_goals_odds,
+                "total_goals_probabilities": total_goals_probs,
+                "total_goals_market_probabilities": total_goals_market_probs,
+                "total_goals_ev": total_goals_ev,
+                "total_goals_kelly_fractions": total_goals_kelly_fractions,
+                "total_goals_source": (external_total_goals_market or {}).get("source", ""),
                 "handicap_probabilities": handicap_probs,
                 "handicap_market_probabilities": handicap_market_probs,
                 "handicap_fused_probabilities": handicap_fused_probs,
@@ -1498,6 +1744,8 @@ def fetch_qtx_future_matches(
                 handicap_odds = [0.0, 0.0, 0.0]
                 asian_handicap_line = None
                 asian_handicap_odds = [0.0, 0.0]
+                total_goals_line = None
+                total_goals_odds = [0.0, 0.0]
                 base_probs = probs
                 ai_probs, ai_adjustment = adjust_probabilities_with_ai_context(probs, prematch, risk_config, None)
                 probs = ai_probs
@@ -1522,6 +1770,12 @@ def fetch_qtx_future_matches(
                     score_grid_rows,
                     asian_handicap_line,
                     asian_handicap_odds,
+                    risk_config,
+                )
+                total_goals_probs, total_goals_market_probs, total_goals_ev, total_goals_kelly_fractions = total_goals_value_metrics(
+                    score_grid_rows,
+                    total_goals_line,
+                    total_goals_odds,
                     risk_config,
                 )
                 rows.append(
@@ -1551,6 +1805,13 @@ def fetch_qtx_future_matches(
                         "asian_handicap_market_probabilities": asian_market_probs,
                         "asian_handicap_ev": asian_ev,
                         "asian_handicap_kelly_fractions": asian_kelly_fractions,
+                        "total_goals_line": total_goals_line,
+                        "total_goals_odds": total_goals_odds,
+                        "total_goals_probabilities": total_goals_probs,
+                        "total_goals_market_probabilities": total_goals_market_probs,
+                        "total_goals_ev": total_goals_ev,
+                        "total_goals_kelly_fractions": total_goals_kelly_fractions,
+                        "total_goals_source": "",
                         "handicap_probabilities": handicap_probs,
                         "handicap_market_probabilities": handicap_market_probs,
                         "handicap_fused_probabilities": handicap_fused_probs,
@@ -1624,6 +1885,36 @@ def apply_external_asian_markets(
         row["asian_handicap_market_probabilities"] = asian_market_probs
         row["asian_handicap_ev"] = asian_ev
         row["asian_handicap_kelly_fractions"] = asian_kelly_fractions
+
+
+def apply_external_total_goals_markets(
+    rows: List[dict],
+    markets: Dict[Tuple[str, str, str], dict],
+    risk_config: Dict[str, float],
+) -> None:
+    for row in rows:
+        market = total_goals_market_for_row(row, markets)
+        if not market:
+            continue
+        line = market.get("line")
+        odds = market.get("odds") or [0.0, 0.0]
+        if line is None or not isinstance(odds, list):
+            continue
+        row["total_goals_line"] = float(line)
+        row["total_goals_odds"] = odds[:2]
+        row["total_goals_source"] = market.get("source", "")
+        score_prediction = row.get("score_prediction") or {}
+        grid = score_prediction.get("score_grid") if isinstance(score_prediction, dict) else None
+        total_probs, total_market_probs, total_ev, total_kelly_fractions = total_goals_value_metrics(
+            grid,
+            row["total_goals_line"],
+            row["total_goals_odds"],
+            risk_config,
+        )
+        row["total_goals_probabilities"] = total_probs
+        row["total_goals_market_probabilities"] = total_market_probs
+        row["total_goals_ev"] = total_ev
+        row["total_goals_kelly_fractions"] = total_kelly_fractions
 
 
 def is_qtx_supplement(row: dict) -> bool:
@@ -1953,13 +2244,8 @@ def ticket_metrics_with_stakes(picks: List[Tuple[dict, int]]) -> Tuple[float, fl
 
 
 def row_html(row: dict) -> str:
-    base_probs = row.get("base_probabilities") or row["probabilities"]
-    probs = row["probabilities"]
-    fused_probs = row.get("fused_probabilities") or probs
     evs = row["ev"]
     kelly_fractions = row.get("kelly_fractions") or [0.0, 0.0, 0.0]
-    probability_cell = probability_text(probs)
-    fused_probability_cell = probability_text(fused_probs)
     ev_cells = " / ".join(f'<span class="{ev_class(x)}">{ev_text(x)}</span>' for x in evs)
     kelly_cells = " / ".join(f"{value * 100:.1f}%" for value in kelly_fractions)
     return (
@@ -1967,10 +2253,6 @@ def row_html(row: dict) -> str:
         f"<td>{html.escape(row['num'])}</td>"
         f"<td>{html.escape(row['match_time'])}</td>"
         f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
-        f"<td>{html.escape(probability_text(base_probs))}</td>"
-        f"<td>{html.escape(probability_cell)}</td>"
-        f"<td>{html.escape(fused_probability_cell)}</td>"
-        f"<td>{html.escape(handicap_probability_text(row))}</td>"
         f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
         f"<td>{html.escape(odds_text(row['normal_odds']))}</td>"
         f"<td>{html.escape(odds_text(row['handicap_odds']))}</td>"
@@ -2050,22 +2332,6 @@ def generate_report(
     if not handicap_rows:
         handicap_rows = '<tr><td colspan="7">当前没有可计算的让球胜平负赔率。</td></tr>'
 
-    asian_rows = "\n".join(
-        "<tr>"
-        f"<td>{html.escape(row['num'])}</td>"
-        f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
-        f"<td>{html.escape(str(row.get('asian_handicap_line')))}</td>"
-        f"<td>{html.escape(asian_probability_text(row))}</td>"
-        f"<td>{html.escape(' / '.join(f'{value:.2f}' for value in (row.get('asian_handicap_odds') or [])))}</td>"
-        f"<td>{html.escape(' / '.join(ev_text(x) for x in (row.get('asian_handicap_ev') or [])))}</td>"
-        f"<td>{html.escape(' / '.join(f'{value * 100:.1f}%' for value in (row.get('asian_handicap_kelly_fractions') or [])))}</td>"
-        "</tr>"
-        for row in display_rows
-        if row.get("asian_handicap_line") is not None and any(value > 0 for value in row.get("asian_handicap_odds", []))
-    )
-    if not asian_rows:
-        asian_rows = '<tr><td colspan="7">当前数据源未提供标准亚盘盘口/水位；已保留亚盘结算框架，待数据接入后自动启用。</td></tr>'
-
     ticket_rows = "\n".join(
         "<tr>"
         f"<td>{html.escape(row['num'])}</td>"
@@ -2137,14 +2403,9 @@ th {{ background: #eef3f8; text-align: left; }}
 </tbody></table>
 </section>
 
-<section id="live-postmatch">
-<h2>赛前/实时/赛后更新</h2>
-<p>当前脚本主要完成赔率、概率和 EV 自动化；首发、伤停、天气和实时赛况建议在赛前 60-90 分钟接入可靠数据源后刷新。</p>
-</section>
-
 <section id="remaining-probabilities">
 <h2>赔率与概率明细</h2>
-<table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>基础概率</th><th>模型概率</th><th>融合概率</th><th>让球预测</th><th>最可能比分</th><th>当前不让球赔率（主胜/平/客胜）</th><th>让球赔率（胜/平/负）</th><th>EV（主胜/平/客胜）</th><th>Kelly%</th><th>备注</th></tr></thead><tbody>
+<table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>最可能比分</th><th>当前不让球赔率（主胜/平/客胜）</th><th>让球赔率（胜/平/负）</th><th>EV（主胜/平/客胜）</th><th>Kelly%</th><th>备注</th></tr></thead><tbody>
 {''.join(row_html(row) for row in display_rows)}
 </tbody></table>
 </section>
@@ -2153,13 +2414,6 @@ th {{ background: #eef3f8; text-align: left; }}
 <h2>辅助：让球胜平负筛选</h2>
 <table><thead><tr><th>编号</th><th>场次</th><th>让球</th><th>让球融合概率</th><th>让球赔率</th><th>让球 EV</th><th>让球 Kelly%</th></tr></thead><tbody>
 {handicap_rows}
-</tbody></table>
-</section>
-
-<section id="asian-handicap-board">
-<h2>辅助：亚盘筛选</h2>
-<table><thead><tr><th>编号</th><th>场次</th><th>盘口</th><th>主队让球结算概率</th><th>主/客水位</th><th>亚盘 EV</th><th>亚盘 Kelly%</th></tr></thead><tbody>
-{asian_rows}
 </tbody></table>
 </section>
 
@@ -2349,6 +2603,13 @@ def serialize_rows(rows: List[dict], generated_at: dt.datetime, odds_url: str) -
                 "asian_handicap_ev": row.get("asian_handicap_ev"),
                 "asian_handicap_kelly_fractions": row.get("asian_handicap_kelly_fractions"),
                 "asian_handicap_source": row.get("asian_handicap_source"),
+                "total_goals_line": row.get("total_goals_line"),
+                "total_goals_odds": row.get("total_goals_odds"),
+                "total_goals_probabilities": row.get("total_goals_probabilities"),
+                "total_goals_market_probabilities": row.get("total_goals_market_probabilities"),
+                "total_goals_ev": row.get("total_goals_ev"),
+                "total_goals_kelly_fractions": row.get("total_goals_kelly_fractions"),
+                "total_goals_source": row.get("total_goals_source"),
                 "handicap_probabilities": row.get("handicap_probabilities"),
                 "handicap_market_probabilities": row.get("handicap_market_probabilities"),
                 "handicap_fused_probabilities": row.get("handicap_fused_probabilities"),
@@ -2413,6 +2674,13 @@ def serialize_training_candidates(rows: List[dict], generated_at: dt.datetime) -
                 "asian_handicap_ev": row.get("asian_handicap_ev"),
                 "asian_handicap_kelly_fractions": row.get("asian_handicap_kelly_fractions"),
                 "asian_handicap_source": row.get("asian_handicap_source"),
+                "total_goals_line": row.get("total_goals_line"),
+                "total_goals_odds": row.get("total_goals_odds"),
+                "total_goals_probabilities": row.get("total_goals_probabilities"),
+                "total_goals_market_probabilities": row.get("total_goals_market_probabilities"),
+                "total_goals_ev": row.get("total_goals_ev"),
+                "total_goals_kelly_fractions": row.get("total_goals_kelly_fractions"),
+                "total_goals_source": row.get("total_goals_source"),
                 "handicap_probabilities": row.get("handicap_probabilities"),
                 "handicap_market_probabilities": row.get("handicap_market_probabilities"),
                 "handicap_fused_probabilities": row.get("handicap_fused_probabilities"),
@@ -2475,8 +2743,12 @@ def main() -> int:
     score_model = load_score_model(score_model_path)
     risk_config = load_risk_config(ROOT / "config" / "bayesian_calibration.json", env)
     asian_handicap_source = env.get("ASIAN_HANDICAP_URL") or env.get("ASIAN_HANDICAP_PATH", "")
-    asian_markets = load_asian_handicap_markets(asian_handicap_source, build_team_aliases(model)) if asian_handicap_source else {}
+    aliases = build_team_aliases(model)
+    asian_markets = load_asian_handicap_markets(asian_handicap_source, aliases) if asian_handicap_source else {}
+    total_goals_source = env.get("TOTAL_GOALS_URL") or env.get("TOTAL_GOALS_PATH", "")
+    total_goals_markets = load_total_goals_markets(total_goals_source, aliases) if total_goals_source else {}
     enable_zgzcw_asian = env.get("ENABLE_ZGZCW_ASIAN_HANDICAP", "0").lower() in {"1", "true", "yes", "on"}
+    enable_zgzcw_total_goals = env.get("ENABLE_ZGZCW_TOTAL_GOALS", "0").lower() in {"1", "true", "yes", "on"}
     if args.odds_html:
         page = decode_page_bytes(Path(args.odds_html).read_bytes())
     else:
@@ -2488,7 +2760,9 @@ def main() -> int:
         score_model=score_model,
         risk_config=risk_config,
         asian_markets=asian_markets,
+        total_goals_markets=total_goals_markets,
         enable_zgzcw_asian=enable_zgzcw_asian,
+        enable_zgzcw_total_goals=enable_zgzcw_total_goals,
     )
     qtx_enabled = args.qtx_supplement or env.get("QTX_SUPPLEMENT", "0").lower() in {"1", "true", "yes", "on"}
     if qtx_enabled:
@@ -2496,6 +2770,8 @@ def main() -> int:
         rows = merge_candidate_rows(rows, qtx_rows)
     if asian_markets:
         apply_external_asian_markets(rows, asian_markets, risk_config)
+    if total_goals_markets:
+        apply_external_total_goals_markets(rows, total_goals_markets, risk_config)
     generated_at = dt.datetime.now()
     rows = filter_nearby_rows(rows, generated_at, days=args.days)
     if not rows:
