@@ -60,6 +60,8 @@ DEFAULT_RISK_CONFIG = {
     "enable_ai_probability_adjustment": 1.0,
     "ai_probability_max_delta": 0.03,
     "ai_probability_high_confidence_delta": 0.05,
+    "value_adjustment_weight": 1.0,
+    "value_adjustment_max_delta": 0.025,
 }
 TEAM_TRANSLATIONS = {
     "Mexico": "墨西哥",
@@ -218,6 +220,8 @@ def load_risk_config(path: Path, env: Optional[Dict[str, str]] = None) -> Dict[s
             ("ENABLE_AI_PROBABILITY_ADJUSTMENT", "enable_ai_probability_adjustment"),
             ("AI_PROBABILITY_MAX_DELTA", "ai_probability_max_delta"),
             ("AI_PROBABILITY_HIGH_CONFIDENCE_DELTA", "ai_probability_high_confidence_delta"),
+            ("VALUE_ADJUSTMENT_WEIGHT", "value_adjustment_weight"),
+            ("VALUE_ADJUSTMENT_MAX_DELTA", "value_adjustment_max_delta"),
         ):
             if env.get(key):
                 try:
@@ -602,6 +606,14 @@ def prematch_adjustments(prematch: Optional[Dict[str, object]]) -> Tuple[float, 
     if f("away_defensive_line") >= 0.62 and f("home_coach_style_counter") >= 1:
         away_mul *= 0.97
         home_mul *= 1.02
+    if f("home_value_ratio") >= 2.0 or f("home_squad_depth_score") - f("away_squad_depth_score") >= 0.25:
+        home_mul *= 1.03
+    if f("away_value_ratio") >= 2.0 or f("away_squad_depth_score") - f("home_squad_depth_score") >= 0.25:
+        away_mul *= 1.03
+    if f("home_absence_value_loss_eur_m") >= 15.0:
+        home_mul *= 0.96
+    if f("away_absence_value_loss_eur_m") >= 15.0:
+        away_mul *= 0.96
 
     metadata = {
         "home_injury_count": f("home_injury_count"),
@@ -624,6 +636,20 @@ def prematch_adjustments(prematch: Optional[Dict[str, object]]) -> Tuple[float, 
         "away_transition_risk": f("away_transition_risk"),
         "tactical_mismatch_home": f("tactical_mismatch_home"),
         "tactical_mismatch_away": f("tactical_mismatch_away"),
+        "home_squad_value_eur_m": f("home_squad_value_eur_m"),
+        "away_squad_value_eur_m": f("away_squad_value_eur_m"),
+        "home_value_ratio": f("home_value_ratio"),
+        "away_value_ratio": f("away_value_ratio"),
+        "home_big5_league_players": f("home_big5_league_players"),
+        "away_big5_league_players": f("away_big5_league_players"),
+        "home_squad_depth_score": f("home_squad_depth_score"),
+        "away_squad_depth_score": f("away_squad_depth_score"),
+        "home_absence_value_loss_eur_m": f("home_absence_value_loss_eur_m"),
+        "away_absence_value_loss_eur_m": f("away_absence_value_loss_eur_m"),
+        "player_value_mismatch_home": f("player_value_mismatch_home"),
+        "player_value_mismatch_away": f("player_value_mismatch_away"),
+        "value_summary": prematch.get("value_summary", "") if prematch else "",
+        "value_source": prematch.get("value_source", "") if prematch else "",
         "home_coach_style_counter": f("home_coach_style_counter"),
         "away_coach_style_counter": f("away_coach_style_counter"),
         "tactical_summary": prematch.get("tactical_summary", "") if prematch else "",
@@ -705,6 +731,18 @@ def score_prediction_from_trained_model(
         "tactical_mismatch_away": 0.0,
         "home_coach_style_counter": 0.0,
         "away_coach_style_counter": 0.0,
+        "home_squad_value_eur_m": 0.0,
+        "away_squad_value_eur_m": 0.0,
+        "home_value_ratio": 1.0,
+        "away_value_ratio": 1.0,
+        "home_big5_league_players": 0.0,
+        "away_big5_league_players": 0.0,
+        "home_squad_depth_score": 0.5,
+        "away_squad_depth_score": 0.5,
+        "home_absence_value_loss_eur_m": 0.0,
+        "away_absence_value_loss_eur_m": 0.0,
+        "player_value_mismatch_home": 0.0,
+        "player_value_mismatch_away": 0.0,
         "home_recent_goals_for": 0.0,
         "home_recent_goals_against": 0.0,
         "away_recent_goals_for": 0.0,
@@ -743,6 +781,18 @@ def score_prediction_from_trained_model(
             feature_map["tactical_mismatch_away"] = prematch_float(prematch, "tactical_mismatch_away")
             feature_map["home_coach_style_counter"] = 1.0 if str(prematch.get("home_coach_style", "")) == "counter" else 0.0
             feature_map["away_coach_style_counter"] = 1.0 if str(prematch.get("away_coach_style", "")) == "counter" else 0.0
+            feature_map["home_squad_value_eur_m"] = prematch_float(prematch, "home_squad_value_eur_m")
+            feature_map["away_squad_value_eur_m"] = prematch_float(prematch, "away_squad_value_eur_m")
+            feature_map["home_value_ratio"] = prematch_float(prematch, "home_value_ratio")
+            feature_map["away_value_ratio"] = prematch_float(prematch, "away_value_ratio")
+            feature_map["home_big5_league_players"] = prematch_float(prematch, "home_big5_league_players")
+            feature_map["away_big5_league_players"] = prematch_float(prematch, "away_big5_league_players")
+            feature_map["home_squad_depth_score"] = prematch_float(prematch, "home_squad_depth_score")
+            feature_map["away_squad_depth_score"] = prematch_float(prematch, "away_squad_depth_score")
+            feature_map["home_absence_value_loss_eur_m"] = prematch_float(prematch, "home_absence_value_loss_eur_m")
+            feature_map["away_absence_value_loss_eur_m"] = prematch_float(prematch, "away_absence_value_loss_eur_m")
+            feature_map["player_value_mismatch_home"] = prematch_float(prematch, "player_value_mismatch_home")
+            feature_map["player_value_mismatch_away"] = prematch_float(prematch, "player_value_mismatch_away")
     features = [float(feature_map.get(name, 0.0)) for name in feature_names]
     lambda_home = clamp_exp(dot(features, home_weights))
     lambda_away = clamp_exp(dot(features, away_weights))
@@ -937,7 +987,8 @@ def parse_odds_page(
                 "probabilities": probs,
                 "ai_adjusted_probabilities": probs,
                 "context_adjusted_probabilities": (ai_adjustment.get("context_adjusted_probabilities") or probs),
-                "tactical_adjusted_probabilities": probs if ai_adjustment.get("applied_tactical") else None,
+                "tactical_adjusted_probabilities": ai_adjustment.get("tactical_adjusted_probabilities"),
+                "value_adjusted_probabilities": ai_adjustment.get("value_adjusted_probabilities"),
                 "ai_adjustment": ai_adjustment,
                 "market_probabilities": market_probs,
                 "fused_probabilities": fused_probs,
@@ -1028,7 +1079,8 @@ def fetch_qtx_future_matches(
                         "probabilities": probs,
                         "ai_adjusted_probabilities": probs,
                         "context_adjusted_probabilities": (ai_adjustment.get("context_adjusted_probabilities") or probs),
-                        "tactical_adjusted_probabilities": probs if ai_adjustment.get("applied_tactical") else None,
+                        "tactical_adjusted_probabilities": ai_adjustment.get("tactical_adjusted_probabilities"),
+                        "value_adjusted_probabilities": ai_adjustment.get("value_adjusted_probabilities"),
                         "ai_adjustment": ai_adjustment,
                         "market_probabilities": market_probs,
                         "fused_probabilities": fused_probs,
@@ -1281,10 +1333,12 @@ def ai_adjustment_summary(row: dict) -> str:
         return f"AI未修正：{reason}"
     delta = adjustment.get("delta") or [0.0, 0.0, 0.0]
     reasons = adjustment.get("reasons") or []
+    value_reasons = adjustment.get("value_reasons") or []
     confidence = str(adjustment.get("confidence", "low"))
     tactical = ((row.get("score_prediction") or {}).get("prematch_adjustments") or {}).get("tactical_summary", "")
     delta_text = " / ".join(f"{OUTCOME_NAMES[idx]} {delta[idx] * 100:+.1f}%" for idx in range(min(3, len(delta))))
-    reason_text = "、".join(str(item) for item in reasons[:3]) if reasons else "赛前情报修正"
+    reason_parts = [str(item) for item in reasons[:2]] + [str(item) for item in value_reasons[:1]]
+    reason_text = "、".join(reason_parts) if reason_parts else "赛前情报修正"
     tactical_text = f"；{tactical}" if tactical else ""
     return f"{delta_text}；置信度 {confidence}；{reason_text}{tactical_text}"
 
@@ -1726,6 +1780,7 @@ def serialize_rows(rows: List[dict], generated_at: dt.datetime, odds_url: str) -
                 "ai_adjusted_probabilities": row.get("ai_adjusted_probabilities"),
                 "context_adjusted_probabilities": row.get("context_adjusted_probabilities"),
                 "tactical_adjusted_probabilities": row.get("tactical_adjusted_probabilities"),
+                "value_adjusted_probabilities": row.get("value_adjusted_probabilities"),
                 "ai_adjustment": row.get("ai_adjustment"),
                 "market_probabilities": row.get("market_probabilities"),
                 "fused_probabilities": row.get("fused_probabilities"),
@@ -1776,6 +1831,7 @@ def serialize_training_candidates(rows: List[dict], generated_at: dt.datetime) -
                 "ai_adjusted_probabilities": row.get("ai_adjusted_probabilities"),
                 "context_adjusted_probabilities": row.get("context_adjusted_probabilities"),
                 "tactical_adjusted_probabilities": row.get("tactical_adjusted_probabilities"),
+                "value_adjusted_probabilities": row.get("value_adjusted_probabilities"),
                 "ai_adjustment": row.get("ai_adjustment"),
                 "normal_odds": row.get("normal_odds"),
                 "handicap_odds": row.get("handicap_odds"),

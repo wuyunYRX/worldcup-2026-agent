@@ -394,6 +394,7 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
     base_stats = probability_metrics.get("base", {})
     context_stats = probability_metrics.get("context", {})
     tactical_stats = probability_metrics.get("tactical", {})
+    value_stats = probability_metrics.get("value", {})
     market_stats = probability_metrics["market"]
     fused_stats = probability_metrics["fused"]
     full_playback = summary.get("full_playback", {}) if isinstance(summary.get("full_playback"), dict) else {}
@@ -415,6 +416,7 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         "base_model_accuracy": base_stats.get("accuracy"),
         "context_model_accuracy": context_stats.get("accuracy"),
         "tactical_model_accuracy": tactical_stats.get("accuracy"),
+        "value_model_accuracy": value_stats.get("accuracy"),
         "model_accuracy": model_stats["accuracy"],
         "market_accuracy": market_stats["accuracy"],
         "fused_accuracy": fused_stats["accuracy"],
@@ -422,11 +424,13 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         "base_model_brier": base_stats.get("brier"),
         "context_model_brier": context_stats.get("brier"),
         "tactical_model_brier": tactical_stats.get("brier"),
+        "value_model_brier": value_stats.get("brier"),
         "market_brier": market_stats["brier"],
         "fused_brier": fused_stats["brier"],
         "base_model_logloss": base_stats.get("logloss"),
         "context_model_logloss": context_stats.get("logloss"),
         "tactical_model_logloss": tactical_stats.get("logloss"),
+        "value_model_logloss": value_stats.get("logloss"),
         "model_logloss": model_stats["logloss"],
         "market_logloss": market_stats["logloss"],
         "fused_logloss": fused_stats["logloss"],
@@ -487,6 +491,23 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         config.setdefault("tactical_adjustment_max_delta", 0.02)
         config["calibration"]["tactical_adjustment_decision"] = "missing_tactical_review_sample_keep"
 
+    config.setdefault("value_adjustment_weight", 1.0)
+    config.setdefault("value_adjustment_max_delta", 0.025)
+    if value_stats.get("sample_size") and tactical_stats.get("brier") is not None and value_stats.get("brier") is not None:
+        value_delta = float(config.get("value_adjustment_max_delta", 0.025))
+        if value_stats["brier"] < tactical_stats["brier"] - 0.005:
+            config["value_adjustment_weight"] = min(1.3, float(config.get("value_adjustment_weight", 1.0)) + 0.1)
+            config["value_adjustment_max_delta"] = min(0.035, value_delta + 0.003)
+            config["calibration"]["value_adjustment_decision"] = "value_outperforms_tactical_expand"
+        elif value_stats["brier"] > tactical_stats["brier"] + 0.005:
+            config["value_adjustment_weight"] = max(0.7, float(config.get("value_adjustment_weight", 1.0)) - 0.1)
+            config["value_adjustment_max_delta"] = max(0.01, value_delta - 0.003)
+            config["calibration"]["value_adjustment_decision"] = "value_underperforms_tactical_reduce"
+        else:
+            config["calibration"]["value_adjustment_decision"] = "value_matches_tactical_keep"
+    else:
+        config["calibration"]["value_adjustment_decision"] = "missing_value_review_sample_keep"
+
     avg_actual_prob = model_stats.get("avg_actual_prob")
     top3_rate = summary["score_metrics"].get("top3_hit_rate")
     if sample_size > 0 and ((avg_actual_prob is not None and avg_actual_prob < 0.45) or (top3_rate is not None and top3_rate < 0.35)):
@@ -522,9 +543,12 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         "ai_probability_high_confidence_delta": config.get("ai_probability_high_confidence_delta"),
         "tactical_adjustment_weight": config.get("tactical_adjustment_weight"),
         "tactical_adjustment_max_delta": config.get("tactical_adjustment_max_delta"),
+        "value_adjustment_weight": config.get("value_adjustment_weight"),
+        "value_adjustment_max_delta": config.get("value_adjustment_max_delta"),
     }
     summary["calibration_ai_decision"] = config["calibration"].get("ai_adjustment_decision")
     summary["calibration_tactical_decision"] = config["calibration"].get("tactical_adjustment_decision")
+    summary["calibration_value_decision"] = config["calibration"].get("value_adjustment_decision")
 
 
 def write_reflection_report(summary: Dict[str, object]) -> Path:
@@ -574,6 +598,7 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
             *[f"- {item}" for item in summary["advice"]],
             f"- AI 修正幅度调优：{summary.get('calibration_ai_decision', 'keep_current_ai_delta')}；当前普通修正上限 {summary['risk_config'].get('ai_probability_max_delta', 0.03):.3f}，高置信度上限 {summary['risk_config'].get('ai_probability_high_confidence_delta', 0.05):.3f}。",
             f"- 战术修正调优：{summary.get('calibration_tactical_decision', 'keep_current_tactical_delta')}；当前战术权重 {summary['risk_config'].get('tactical_adjustment_weight', 1.0):.2f}，战术修正上限 {summary['risk_config'].get('tactical_adjustment_max_delta', 0.02):.3f}。",
+            f"- 价值修正调优：{summary.get('calibration_value_decision', 'keep_current_value_delta')}；当前价值权重 {summary['risk_config'].get('value_adjustment_weight', 1.0):.2f}，价值修正上限 {summary['risk_config'].get('value_adjustment_max_delta', 0.025):.3f}。",
             f"- 本轮样本只有 {summary['reviewed_matches']} 场，不调整模型/市场融合权重；只做短期风控收紧。",
             f"- 已将 Kelly 从 1/4 降到不高于 1/5，并将最小 EV 门槛提高到 7%；总投入上限保留为 {summary['risk_config']['max_total_stake']:.0f} 元。",
             "",
@@ -614,6 +639,7 @@ def main() -> int:
         base_probs = normalize_probs(prediction_row.get("base_probabilities")) or model_probs
         context_probs = normalize_probs(prediction_row.get("context_adjusted_probabilities")) or model_probs
         tactical_probs = normalize_probs(prediction_row.get("tactical_adjusted_probabilities"))
+        value_probs = normalize_probs(prediction_row.get("value_adjusted_probabilities"))
         market_probs = normalize_probs(prediction_row.get("market_probabilities")) or market_probs_from_odds(prediction_row.get("normal_odds"))
         fused_probs = normalize_probs(prediction_row.get("fused_probabilities")) or model_probs
         reviewed.append(
@@ -629,6 +655,7 @@ def main() -> int:
                 "base_model_probabilities": base_probs,
                 "context_adjusted_probabilities": context_probs,
                 "tactical_adjusted_probabilities": tactical_probs,
+                "value_adjusted_probabilities": value_probs,
                 "model_probabilities": model_probs,
                 "market_probabilities": market_probs,
                 "fused_probabilities": fused_probs,
@@ -637,6 +664,7 @@ def main() -> int:
                 "base_model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: base_probs[idx])] if base_probs else None,
                 "context_model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: context_probs[idx])] if context_probs else None,
                 "tactical_model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: tactical_probs[idx])] if tactical_probs else None,
+                "value_model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: value_probs[idx])] if value_probs else None,
                 "model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: model_probs[idx])] if model_probs else None,
                 "fused_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: fused_probs[idx])] if fused_probs else None,
                 "predicted_top3": prediction.get("top_scores") or [],
@@ -660,6 +688,7 @@ def main() -> int:
             "base": probability_stats(reviewed, "base_model_probabilities"),
             "context": probability_stats(reviewed, "context_adjusted_probabilities"),
             "tactical": probability_stats(reviewed, "tactical_adjusted_probabilities"),
+            "value": probability_stats(reviewed, "value_adjusted_probabilities"),
             "model": probability_stats(reviewed, "model_probabilities"),
             "market": probability_stats(reviewed, "market_probabilities"),
             "fused": probability_stats(reviewed, "fused_probabilities"),

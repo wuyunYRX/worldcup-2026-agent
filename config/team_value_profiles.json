@@ -1,0 +1,66 @@
+{
+  "阿根廷": {
+    "squad_value_eur_m": 850.0,
+    "top_player_value_eur_m": 120.0,
+    "big5_league_players": 18,
+    "squad_depth_score": 0.88,
+    "star_dependency": 0.42,
+    "core_player_count": 6
+  },
+  "奥地利": {
+    "squad_value_eur_m": 250.0,
+    "top_player_value_eur_m": 55.0,
+    "big5_league_players": 14,
+    "squad_depth_score": 0.72,
+    "star_dependency": 0.48,
+    "core_player_count": 4
+  },
+  "法国": {
+    "squad_value_eur_m": 1230.0,
+    "top_player_value_eur_m": 180.0,
+    "big5_league_players": 22,
+    "squad_depth_score": 0.93,
+    "star_dependency": 0.39,
+    "core_player_count": 7
+  },
+  "伊拉克": {
+    "squad_value_eur_m": 55.0,
+    "top_player_value_eur_m": 8.0,
+    "big5_league_players": 1,
+    "squad_depth_score": 0.31,
+    "star_dependency": 0.61,
+    "core_player_count": 2
+  },
+  "挪威": {
+    "squad_value_eur_m": 589.9,
+    "top_player_value_eur_m": 180.0,
+    "big5_league_players": 16,
+    "squad_depth_score": 0.78,
+    "star_dependency": 0.62,
+    "core_player_count": 4
+  },
+  "塞内加尔": {
+    "squad_value_eur_m": 240.0,
+    "top_player_value_eur_m": 45.0,
+    "big5_league_players": 10,
+    "squad_depth_score": 0.61,
+    "star_dependency": 0.53,
+    "core_player_count": 3
+  },
+  "约旦": {
+    "squad_value_eur_m": 20.3,
+    "top_player_value_eur_m": 4.0,
+    "big5_league_players": 0,
+    "squad_depth_score": 0.28,
+    "star_dependency": 0.55,
+    "core_player_count": 2
+  },
+  "阿尔及利亚": {
+    "squad_value_eur_m": 256.9,
+    "top_player_value_eur_m": 35.0,
+    "big5_league_players": 11,
+    "squad_depth_score": 0.68,
+    "star_dependency": 0.47,
+    "core_player_count": 4
+  }
+}

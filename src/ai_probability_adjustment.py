@@ -66,6 +66,16 @@ def adjust_probabilities_with_ai_context(
     away_stability = _f(prematch, "away_tactical_stability")
     mismatch_home = _f(prematch, "tactical_mismatch_home")
     mismatch_away = _f(prematch, "tactical_mismatch_away")
+    home_value_ratio = _f(prematch, "home_value_ratio")
+    away_value_ratio = _f(prematch, "away_value_ratio")
+    home_big5 = _f(prematch, "home_big5_league_players")
+    away_big5 = _f(prematch, "away_big5_league_players")
+    home_depth = _f(prematch, "home_squad_depth_score")
+    away_depth = _f(prematch, "away_squad_depth_score")
+    home_absence_loss = _f(prematch, "home_absence_value_loss_eur_m")
+    away_absence_loss = _f(prematch, "away_absence_value_loss_eur_m")
+    value_mismatch_home = _f(prematch, "player_value_mismatch_home")
+    value_mismatch_away = _f(prematch, "player_value_mismatch_away")
     home_style = str(prematch.get("home_coach_style", "")) if prematch else ""
     away_style = str(prematch.get("away_coach_style", "")) if prematch else ""
 
@@ -214,7 +224,66 @@ def adjust_probabilities_with_ai_context(
         tactical_reasons.append("客队战术克制更有利")
         signal_strength += delta
 
-    if not reasons:
+    tactical_adjusted = _normalize((adjusted[0], adjusted[1], adjusted[2]))
+    adjusted = list(tactical_adjusted)
+
+    value_reasons: List[str] = []
+    value_enabled = (home_value_ratio >= 2.0 or away_value_ratio >= 2.0 or abs(home_big5 - away_big5) >= 5 or abs(home_depth - away_depth) >= 0.25 or home_absence_loss >= 15.0 or away_absence_loss >= 15.0)
+    value_adjusted = list(adjusted)
+    value_limit = min(float(risk_config.get("value_adjustment_max_delta", 0.025)), max_delta)
+    value_weight = float(risk_config.get("value_adjustment_weight", 1.0))
+    if value_enabled:
+        if home_value_ratio >= 2.0:
+            delta = min(value_limit, 0.012 * value_weight)
+            value_adjusted[0] += delta
+            value_adjusted[1] -= delta * 0.55
+            value_adjusted[2] -= delta * 0.45
+            value_reasons.append("主队总身价显著占优")
+        if away_value_ratio >= 2.0:
+            delta = min(value_limit, 0.012 * value_weight)
+            value_adjusted[2] += delta
+            value_adjusted[1] -= delta * 0.55
+            value_adjusted[0] -= delta * 0.45
+            value_reasons.append("客队总身价显著占优")
+        if home_big5 - away_big5 >= 5 or home_depth - away_depth >= 0.25:
+            delta = min(value_limit, 0.008 * value_weight)
+            value_adjusted[0] += delta
+            value_adjusted[1] -= delta * 0.5
+            value_adjusted[2] -= delta * 0.5
+            value_reasons.append("主队阵容深度与五大联赛经验占优")
+        if away_big5 - home_big5 >= 5 or away_depth - home_depth >= 0.25:
+            delta = min(value_limit, 0.008 * value_weight)
+            value_adjusted[2] += delta
+            value_adjusted[1] -= delta * 0.5
+            value_adjusted[0] -= delta * 0.5
+            value_reasons.append("客队阵容深度与五大联赛经验占优")
+        if home_absence_loss >= 15.0:
+            delta = min(value_limit, 0.01 * value_weight)
+            value_adjusted[0] -= delta
+            value_adjusted[1] += delta * 0.5
+            value_adjusted[2] += delta * 0.5
+            value_reasons.append("主队核心缺阵价值损失较大")
+        if away_absence_loss >= 15.0:
+            delta = min(value_limit, 0.01 * value_weight)
+            value_adjusted[2] -= delta
+            value_adjusted[1] += delta * 0.5
+            value_adjusted[0] += delta * 0.5
+            value_reasons.append("客队核心缺阵价值损失较大")
+        if value_mismatch_home > 0.15:
+            delta = min(value_limit, 0.008 * value_weight)
+            value_adjusted[0] += delta
+            value_adjusted[1] -= delta * 0.5
+            value_adjusted[2] -= delta * 0.5
+            value_reasons.append("主队球员能力体系更完整")
+        if value_mismatch_away > 0.15:
+            delta = min(value_limit, 0.008 * value_weight)
+            value_adjusted[2] += delta
+            value_adjusted[1] -= delta * 0.5
+            value_adjusted[0] -= delta * 0.5
+            value_reasons.append("客队球员能力体系更完整")
+        adjusted = value_adjusted
+
+    if not reasons and not value_reasons:
         return probabilities, {"enabled": True, "applied": False, "reason": "no_material_signal"}
 
     confidence = "high" if lineup_known >= 1 and signal_strength >= 0.045 else "medium" if signal_strength >= 0.02 else "low"
@@ -232,11 +301,15 @@ def adjust_probabilities_with_ai_context(
         "applied": True,
         "base_probabilities": list(probabilities),
         "context_adjusted_probabilities": list(context_adjusted),
+        "tactical_adjusted_probabilities": list(tactical_adjusted),
+        "value_adjusted_probabilities": list(normalized),
         "adjusted_probabilities": list(normalized),
         "delta": final_deltas,
         "reasons": reasons,
         "context_reasons": context_reasons,
         "tactical_reasons": tactical_reasons,
         "applied_tactical": bool(tactical_reasons),
+        "value_reasons": value_reasons,
+        "applied_value": bool(value_reasons),
         "confidence": confidence,
     }

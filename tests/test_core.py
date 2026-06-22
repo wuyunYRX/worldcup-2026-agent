@@ -67,6 +67,16 @@ class CoreMathTests(unittest.TestCase):
         self.assertTrue(meta["applied"])
         self.assertGreater(probs[2], 0.24)
 
+    def test_ai_adjustment_uses_value_gap_when_ratio_is_large(self):
+        probs, meta = adjust_probabilities_with_ai_context(
+            (0.45, 0.27, 0.28),
+            {"home_value_ratio": 2.5, "away_value_ratio": 0.4, "home_big5_league_players": 14, "away_big5_league_players": 3, "home_squad_depth_score": 0.8, "away_squad_depth_score": 0.45},
+            {"enable_ai_probability_adjustment": 1.0, "ai_probability_max_delta": 0.03, "ai_probability_high_confidence_delta": 0.05, "value_adjustment_weight": 1.0, "value_adjustment_max_delta": 0.025},
+        )
+        self.assertIsNotNone(probs)
+        self.assertTrue(meta["applied_value"])
+        self.assertGreater(probs[0], 0.45)
+
     def test_review_metrics(self):
         probs = market_probs_from_odds([2.0, 4.0, 4.0])
         self.assertIsNotNone(probs)

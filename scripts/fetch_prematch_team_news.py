@@ -19,6 +19,7 @@ OUT_PATH = ROOT / "data" / "raw" / "prematch_team_news.json"
 DEFAULT_QTX_QINGBAO_BASE_URL = "https://live.qtx.com/qingbao"
 DEFAULT_LLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_LLM_MODEL = "glm-4-flash"
+TEAM_VALUE_PROFILES_PATH = ROOT / "config" / "team_value_profiles.json"
 
 INJURY_HINTS = ("伤停", "伤病", "缺阵", "伤缺", "受伤", "复出")
 SUSPENSION_HINTS = ("停赛", "禁赛", "红牌", "黄牌停赛")
@@ -32,6 +33,7 @@ LOW_BLOCK_HINTS = ("低位防守", "密集防守", "摆大巴")
 DIRECT_HINTS = ("长传", "冲吊", "边路冲击", "快速推进")
 SET_PIECE_HINTS = ("定位球", "角球", "任意球", "高空球")
 FORMATION_HINTS = ("4-3-3", "4-2-3-1", "3-5-2", "5-4-1", "3-4-3", "4-4-2")
+VALUE_HINTS = ("总身价", "阵容总身价", "身价达", "身价≥", "来自五大联赛", "五大联赛")
 
 
 def post_json(api_key: str, url: str, payload: Dict[str, Any], timeout: int) -> Dict[str, Any]:
@@ -98,6 +100,18 @@ def load_env(path: Path) -> Dict[str, str]:
             key, value = line.split("=", 1)
             env[key.strip()] = value.strip().strip('"').strip("'")
     return env
+
+
+def load_team_value_profiles(path: Path = TEAM_VALUE_PROFILES_PATH) -> Dict[str, Dict[str, object]]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(team): values for team, values in payload.items() if isinstance(values, dict)}
 
 
 def latest_snapshot() -> Path:
@@ -265,6 +279,153 @@ def tactical_llm_enhancement(raw_text: str, home: str, away: str, current: Dict[
     return merged
 
 
+def extract_money_values(text: str) -> List[float]:
+    values: List[float] = []
+    for number, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(亿欧|万欧|万欧元|亿欧元|百万欧|百万欧元)", text):
+        amount = float(number)
+        if "亿" in unit:
+            values.append(amount * 100.0)
+        elif "万" in unit:
+            values.append(amount / 100.0)
+        else:
+            values.append(amount)
+    return values
+
+
+def value_summary_from_text(sentences: List[str], home: str, away: str, profiles: Dict[str, Dict[str, object]]) -> Dict[str, object]:
+    home_profile = dict(profiles.get(home, {}))
+    away_profile = dict(profiles.get(away, {}))
+
+    def get_float(team_profile: Dict[str, object], key: str, default: float) -> float:
+        try:
+            return float(team_profile.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    home_squad_value = get_float(home_profile, "squad_value_eur_m", 0.0)
+    away_squad_value = get_float(away_profile, "squad_value_eur_m", 0.0)
+    home_top_value = get_float(home_profile, "top_player_value_eur_m", 0.0)
+    away_top_value = get_float(away_profile, "top_player_value_eur_m", 0.0)
+    home_big5 = get_float(home_profile, "big5_league_players", 0.0)
+    away_big5 = get_float(away_profile, "big5_league_players", 0.0)
+    home_depth = get_float(home_profile, "squad_depth_score", 0.5)
+    away_depth = get_float(away_profile, "squad_depth_score", 0.5)
+    home_star_dep = get_float(home_profile, "star_dependency", 0.5)
+    away_star_dep = get_float(away_profile, "star_dependency", 0.5)
+
+    text_blob = " ".join(sentences)
+    for team_name, role in ((home, "home"), (away, "away")):
+        for sentence in sentences:
+            if team_name in sentence and any(hint in sentence for hint in VALUE_HINTS):
+                values = extract_money_values(sentence)
+                if values:
+                    if role == "home":
+                        home_squad_value = max(home_squad_value, max(values))
+                    else:
+                        away_squad_value = max(away_squad_value, max(values))
+                match = re.search(r"共(\d+)名球员来自五大联赛", sentence)
+                if match:
+                    if role == "home":
+                        home_big5 = max(home_big5, float(match.group(1)))
+                    else:
+                        away_big5 = max(away_big5, float(match.group(1)))
+        ratio_patterns = [
+            (rf"{re.escape(home)}身价≥{re.escape(away)}身价的(\d+(?:\.\d+)?)倍", "home"),
+            (rf"{re.escape(away)}身价≥{re.escape(home)}身价的(\d+(?:\.\d+)?)倍", "away"),
+        ]
+        for pattern, role_name in ratio_patterns:
+            match = re.search(pattern, text_blob)
+            if match:
+                ratio = float(match.group(1))
+                if role_name == "home" and away_squad_value > 0:
+                    home_squad_value = max(home_squad_value, away_squad_value * ratio)
+                if role_name == "away" and home_squad_value > 0:
+                    away_squad_value = max(away_squad_value, home_squad_value * ratio)
+
+    home_value_ratio = home_squad_value / away_squad_value if away_squad_value > 0 else 1.0
+    away_value_ratio = away_squad_value / home_squad_value if home_squad_value > 0 else 1.0
+    player_value_mismatch_home = max(min((home_value_ratio - 1.0) / 4.0 + (home_big5 - away_big5) / 25.0, 1.0), -1.0)
+    player_value_mismatch_away = max(min((away_value_ratio - 1.0) / 4.0 + (away_big5 - home_big5) / 25.0, 1.0), -1.0)
+    summary = "主队价值体系与客队接近"
+    if home_value_ratio >= 2.0 or home_big5 - away_big5 >= 5:
+        summary = "主队总身价与阵容深度占优"
+    elif away_value_ratio >= 2.0 or away_big5 - home_big5 >= 5:
+        summary = "客队总身价与阵容深度占优"
+    return {
+        "home_squad_value_eur_m": round(home_squad_value, 3),
+        "away_squad_value_eur_m": round(away_squad_value, 3),
+        "home_value_ratio": round(home_value_ratio, 3),
+        "away_value_ratio": round(away_value_ratio, 3),
+        "home_top_player_value_eur_m": round(home_top_value, 3),
+        "away_top_player_value_eur_m": round(away_top_value, 3),
+        "home_core_player_count": int(home_profile.get("core_player_count", 0) or 0),
+        "away_core_player_count": int(away_profile.get("core_player_count", 0) or 0),
+        "home_big5_league_players": int(home_big5),
+        "away_big5_league_players": int(away_big5),
+        "home_squad_depth_score": round(home_depth, 3),
+        "away_squad_depth_score": round(away_depth, 3),
+        "home_star_dependency": round(home_star_dep, 3),
+        "away_star_dependency": round(away_star_dep, 3),
+        "home_absence_value_loss_eur_m": 0.0,
+        "away_absence_value_loss_eur_m": 0.0,
+        "player_value_mismatch_home": round(player_value_mismatch_home, 3),
+        "player_value_mismatch_away": round(player_value_mismatch_away, 3),
+        "value_summary": summary,
+        "value_source": "keyword_rule" if home_squad_value > 0 or away_squad_value > 0 else "profile_fallback",
+    }
+
+
+def build_value_prompt(home: str, away: str, text: str, current: Dict[str, object]) -> str:
+    return (
+        "请仅返回 JSON，不要解释。根据赛前情报提取双方球员能力与球队价值体系字段。"
+        "字段必须包含：home_squad_value_eur_m, away_squad_value_eur_m, home_value_ratio, away_value_ratio, "
+        "home_top_player_value_eur_m, away_top_player_value_eur_m, home_core_player_count, away_core_player_count, "
+        "home_big5_league_players, away_big5_league_players, home_squad_depth_score, away_squad_depth_score, "
+        "home_star_dependency, away_star_dependency, home_absence_value_loss_eur_m, away_absence_value_loss_eur_m, "
+        "player_value_mismatch_home, player_value_mismatch_away, value_summary。"
+        f"\n主队：{home}\n客队：{away}\n规则结果：{json.dumps(current, ensure_ascii=False)}\n赛前情报：{text[:2400]}"
+    )
+
+
+def value_llm_enhancement(raw_text: str, home: str, away: str, current: Dict[str, object], env: Dict[str, str]) -> Dict[str, object]:
+    enabled = env.get("ENABLE_LLM_PLAYER_VALUE_ANALYSIS", "1").lower() in {"1", "true", "yes", "on"}
+    api_key = env.get("LLM_API_KEY", "") or env.get("ZHIPU_API_KEY", "") or env.get("OPENAI_API_KEY", "")
+    if not enabled or not api_key:
+        return current
+    base_url = env.get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL)
+    model = env.get("LLM_MODEL", DEFAULT_LLM_MODEL)
+    timeout = int(env.get("PLAYER_VALUE_LLM_TIMEOUT", "60") or "60")
+    prompt = build_value_prompt(home, away, raw_text, current)
+    try:
+        text = call_llm(api_key, prompt, base_url, model, timeout)
+        payload = parse_json_object(text)
+    except Exception:
+        return {**current, "value_source": "keyword_rule_llm_failed"}
+    if not payload:
+        return {**current, "value_source": "keyword_rule_llm_failed"}
+    merged = {**current}
+    for key in (
+        "value_summary",
+    ):
+        if key in payload and payload[key] is not None:
+            merged[key] = payload[key]
+    numeric_keys = (
+        "home_squad_value_eur_m", "away_squad_value_eur_m", "home_value_ratio", "away_value_ratio",
+        "home_top_player_value_eur_m", "away_top_player_value_eur_m", "home_core_player_count", "away_core_player_count",
+        "home_big5_league_players", "away_big5_league_players", "home_squad_depth_score", "away_squad_depth_score",
+        "home_star_dependency", "away_star_dependency", "home_absence_value_loss_eur_m", "away_absence_value_loss_eur_m",
+        "player_value_mismatch_home", "player_value_mismatch_away",
+    )
+    for key in numeric_keys:
+        if key in payload:
+            try:
+                merged[key] = float(payload[key])
+            except (TypeError, ValueError):
+                continue
+    merged["value_source"] = "keyword_rule_and_llm"
+    return merged
+
+
 def analyze_qingbao(text: str, home: str, away: str) -> Dict[str, object]:
     raw_text = html_to_text(text)
     sentences = [normalize(part) for part in re.split(r"[。！？\n]", raw_text) if normalize(part)]
@@ -283,6 +444,7 @@ def analyze_qingbao(text: str, home: str, away: str) -> Dict[str, object]:
 
     supporting = [s for s in sentences if any(h in s for h in INJURY_HINTS + SUSPENSION_HINTS + LINEUP_HINTS + ROTATION_HINTS + MUST_WIN_HINTS)][:12]
     tactical = tactical_feature_summary(sentences, home, away)
+    value_summary = value_summary_from_text(sentences, home, away, load_team_value_profiles())
     return {
         "home_injury_count": home_injury,
         "away_injury_count": away_injury,
@@ -296,12 +458,14 @@ def analyze_qingbao(text: str, home: str, away: str) -> Dict[str, object]:
         "must_win_flag_away": must_win_flag_away,
         "supporting_sentences": supporting,
         **tactical,
+        **value_summary,
     }
 
 
 def main() -> int:
     env = {**os.environ, **load_env(ROOT / ".env")}
     qingbao_base_url = env.get("QTX_QINGBAO_BASE_URL", DEFAULT_QTX_QINGBAO_BASE_URL)
+    profiles = load_team_value_profiles()
     snapshot = json.loads(latest_snapshot().read_text(encoding="utf-8"))
     matches = snapshot.get("matches", [])
     results: List[Dict[str, object]] = []
@@ -312,6 +476,7 @@ def main() -> int:
         away = str(item.get("away", ""))
         match_time = str(item.get("match_time", ""))
         token = extract_match_token(item)
+        value_defaults = value_summary_from_text([], home, away, profiles)
         entry: Dict[str, object] = {
             "match_time": match_time,
             "home_team": home,
@@ -342,6 +507,7 @@ def main() -> int:
             "tactical_mismatch_away": 0.0,
             "tactical_summary": "",
             "tactical_source": "none",
+            **value_defaults,
             "source": "qtx_qingbao_prototype",
             "qtx_match_token": token,
             "supporting_sentences": [],
@@ -351,6 +517,7 @@ def main() -> int:
                 page = fetch(qingbao_url(token, qingbao_base_url))
                 parsed = analyze_qingbao(page, home, away)
                 parsed = tactical_llm_enhancement(html_to_text(page), home, away, parsed, env)
+                parsed = value_llm_enhancement(html_to_text(page), home, away, parsed, env)
                 entry.update(parsed)
             except Exception as exc:
                 entry["fetch_error"] = type(exc).__name__
