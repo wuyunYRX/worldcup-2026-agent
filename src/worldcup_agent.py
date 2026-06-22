@@ -1445,7 +1445,6 @@ def row_html(row: dict) -> str:
         f"<td>{html.escape(probability_cell)}</td>"
         f"<td>{html.escape(fused_probability_cell)}</td>"
         f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
-        f"<td>{html.escape(ai_adjustment_summary(row))}</td>"
         f"<td>{html.escape(odds_text(row['normal_odds']))}</td>"
         f"<td>{ev_cells}</td>"
         f"<td>{html.escape(kelly_cells)}</td>"
@@ -1476,7 +1475,6 @@ def generate_report(
         f"<td>{html.escape(result_pick_text(row))}</td>"
         f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
         f"<td>{html.escape(goal_trend_text(row['score_prediction']))}</td>"
-        f"<td>{html.escape(result_reason_text(row))}；{html.escape(ai_adjustment_summary(row))}</td>"
         "</tr>"
         for row in focus
     )
@@ -1492,8 +1490,6 @@ def generate_report(
         f"<td>{html.escape(probability_text(row.get('fused_probabilities') or row['probabilities']))}</td>"
         f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
         f"<td>{html.escape(goal_trend_text(row['score_prediction']))}</td>"
-        f"<td>{html.escape(ai_adjustment_summary(row))}</td>"
-        f"<td>{html.escape(result_reason_text(row))}</td>"
         "</tr>"
         for row in display_rows
     )
@@ -1572,21 +1568,16 @@ th {{ background: #eef3f8; text-align: left; }}
 
 <section id="matches-24h">
 <h2>今日/未来 24 小时重点预测</h2>
-<table><thead><tr><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>最可能比分</th><th>进球倾向</th><th>预测依据</th></tr></thead><tbody>
+<table><thead><tr><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>最可能比分</th><th>进球倾向</th></tr></thead><tbody>
 {focus_rows}
 </tbody></table>
 </section>
 
 <section id="result-predictions">
 <h2>赛果预测总览</h2>
-<table><thead><tr><th>编号</th><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>修正前概率</th><th>AI修正后概率</th><th>融合概率</th><th>比分 Top3</th><th>进球倾向</th><th>AI修正</th><th>依据</th></tr></thead><tbody>
+<table><thead><tr><th>编号</th><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>修正前概率</th><th>AI修正后概率</th><th>融合概率</th><th>比分 Top3</th><th>进球倾向</th></tr></thead><tbody>
 {result_rows}
 </tbody></table>
-</section>
-
-<section id="group-update">
-<h2>小组名次和最佳第三名变化</h2>
-{group_update_html()}
 </section>
 
 <section id="live-postmatch">
@@ -1596,7 +1587,7 @@ th {{ background: #eef3f8; text-align: left; }}
 
 <section id="remaining-probabilities">
 <h2>赔率与概率明细</h2>
-<table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>修正前概率</th><th>AI修正后概率</th><th>融合概率</th><th>最可能比分</th><th>AI修正</th><th>当前不让球赔率（主胜/平/客胜）</th><th>EV（主胜/平/客胜）</th><th>Kelly%</th><th>备注</th></tr></thead><tbody>
+<table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>修正前概率</th><th>AI修正后概率</th><th>融合概率</th><th>最可能比分</th><th>当前不让球赔率（主胜/平/客胜）</th><th>EV（主胜/平/客胜）</th><th>Kelly%</th><th>备注</th></tr></thead><tbody>
 {''.join(row_html(row) for row in display_rows)}
 </tbody></table>
 </section>
@@ -1634,13 +1625,6 @@ th {{ background: #eef3f8; text-align: left; }}
 </ul>
 </section>
 
-<section id="sources">
-<h2>来源</h2>
-<ul>
-<li><a href="{html.escape(odds_url)}">足彩网竞彩足球胜平负/让球赔率页</a></li>
-<li><a href="{html.escape(fifa_scores_url)}">FIFA 2026 World Cup scores and fixtures</a></li>
-</ul>
-</section>
 </main>
 </body>
 </html>
