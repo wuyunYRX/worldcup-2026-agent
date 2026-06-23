@@ -20,8 +20,8 @@ pause_before_exit() {
         echo "执行失败：停在 ${CURRENT_STEP}/${TOTAL_STEPS}（${CURRENT_PERCENT}%）：${CURRENT_LABEL}"
         echo "请检查上方错误信息，按任意键关闭窗口..."
     fi
-    if [ -r /dev/tty ]; then
-        IFS= read -r -n 1 _ </dev/tty || true
+    if [ -t 0 ]; then
+        IFS= read -r -n 1 _ || true
         echo
     fi
     exit "$status"
@@ -64,6 +64,13 @@ MONTE_CARLO_SEED=202606
 MONTE_CARLO_LAMBDA_SIGMA=0.10
 SCORE_CANDIDATE_TOP_N=5
 SCORE_REPORT_TOP_N=3
+ENABLE_LLM_TACTICAL_ANALYSIS=1
+ENABLE_LLM_PLAYER_VALUE_ANALYSIS=1
+PREMATCH_SOURCE_CACHE=1
+PREMATCH_LLM_CACHE=1
+PREMATCH_LLM_TIMEOUT=20
+TACTICAL_LLM_TIMEOUT=20
+PLAYER_VALUE_LLM_TIMEOUT=20
 EOF
 finish_step
 

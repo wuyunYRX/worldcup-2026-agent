@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -21,6 +22,8 @@ DEFAULT_LLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_LLM_MODEL = "glm-4-flash"
 TEAM_VALUE_PROFILES_PATH = ROOT / "config" / "team_value_profiles.json"
 MATCH_WEATHER_PATH = ROOT / "data" / "raw" / "match_weather_forecast.json"
+SOURCE_CACHE_PATH = ROOT / "data" / "raw" / "prematch_source_cache.json"
+LLM_CACHE_PATH = ROOT / "data" / "raw" / "prematch_llm_cache.json"
 
 INJURY_HINTS = ("伤停", "伤病", "缺阵", "伤缺", "受伤", "复出")
 SUSPENSION_HINTS = ("停赛", "禁赛", "红牌", "黄牌停赛")
@@ -102,6 +105,25 @@ def load_env(path: Path) -> Dict[str, str]:
             key, value = line.split("=", 1)
             env[key.strip()] = value.strip().strip('"').strip("'")
     return env
+
+
+def load_json_dict(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_json_dict(path: Path, payload: Dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def cache_key(*parts: object) -> str:
+    raw = "|".join(str(part) for part in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def load_team_value_profiles(path: Path = TEAM_VALUE_PROFILES_PATH) -> Dict[str, Dict[str, object]]:
@@ -298,7 +320,7 @@ def tactical_llm_enhancement(raw_text: str, home: str, away: str, current: Dict[
         return current
     base_url = env.get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL)
     model = env.get("LLM_MODEL", DEFAULT_LLM_MODEL)
-    timeout = int(env.get("TACTICAL_LLM_TIMEOUT", "60") or "60")
+    timeout = int(env.get("TACTICAL_LLM_TIMEOUT", "20") or "20")
     prompt = build_tactical_prompt(home, away, raw_text, current)
     try:
         text = call_llm(api_key, prompt, base_url, model, timeout)
@@ -442,7 +464,7 @@ def value_llm_enhancement(raw_text: str, home: str, away: str, current: Dict[str
         return current
     base_url = env.get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL)
     model = env.get("LLM_MODEL", DEFAULT_LLM_MODEL)
-    timeout = int(env.get("PLAYER_VALUE_LLM_TIMEOUT", "60") or "60")
+    timeout = int(env.get("PLAYER_VALUE_LLM_TIMEOUT", "20") or "20")
     prompt = build_value_prompt(home, away, raw_text, current)
     try:
         text = call_llm(api_key, prompt, base_url, model, timeout)
@@ -471,6 +493,78 @@ def value_llm_enhancement(raw_text: str, home: str, away: str, current: Dict[str
             except (TypeError, ValueError):
                 continue
     merged["value_source"] = "keyword_rule_and_llm"
+    return merged
+
+
+def build_prematch_prompt(home: str, away: str, text: str, current: Dict[str, object]) -> str:
+    return (
+        "请仅返回 JSON，不要解释。根据赛前情报同时提取战术体系、球员价值和天气线索。"
+        "可返回字段包括：home_coach_style, away_coach_style, home_formation, away_formation, "
+        "home_pressing_level, away_pressing_level, home_defensive_line, away_defensive_line, "
+        "home_tactical_stability, away_tactical_stability, home_transition_risk, away_transition_risk, "
+        "tactical_mismatch_home, tactical_mismatch_away, tactical_summary, "
+        "home_squad_value_eur_m, away_squad_value_eur_m, home_value_ratio, away_value_ratio, "
+        "home_top_player_value_eur_m, away_top_player_value_eur_m, home_core_player_count, away_core_player_count, "
+        "home_big5_league_players, away_big5_league_players, home_squad_depth_score, away_squad_depth_score, "
+        "home_star_dependency, away_star_dependency, home_absence_value_loss_eur_m, away_absence_value_loss_eur_m, "
+        "player_value_mismatch_home, player_value_mismatch_away, value_summary, weather_summary。"
+        "所有强度类数值范围 0 到 1。\n"
+        f"主队：{home}\n客队：{away}\n"
+        f"规则提取结果：{json.dumps(current, ensure_ascii=False)}\n"
+        f"赛前情报：{text[:3200]}"
+    )
+
+
+def prematch_llm_enhancement(raw_text: str, home: str, away: str, current: Dict[str, object], env: Dict[str, str], llm_cache: Dict[str, Any]) -> Dict[str, object]:
+    enabled = (
+        env.get("ENABLE_LLM_TACTICAL_ANALYSIS", "1").lower() in {"1", "true", "yes", "on"}
+        or env.get("ENABLE_LLM_PLAYER_VALUE_ANALYSIS", "1").lower() in {"1", "true", "yes", "on"}
+    )
+    api_key = env.get("LLM_API_KEY", "") or env.get("ZHIPU_API_KEY", "") or env.get("OPENAI_API_KEY", "")
+    if not enabled or not api_key:
+        return {**current, "llm_status": "disabled_or_missing_key"}
+    base_url = env.get("LLM_BASE_URL", DEFAULT_LLM_BASE_URL)
+    model = env.get("LLM_MODEL", DEFAULT_LLM_MODEL)
+    timeout = int(env.get("PREMATCH_LLM_TIMEOUT", env.get("TACTICAL_LLM_TIMEOUT", "20")) or "20")
+    use_cache = env.get("PREMATCH_LLM_CACHE", "1").lower() in {"1", "true", "yes", "on"}
+    key = cache_key(model, home, away, raw_text[:6000])
+    if use_cache and key in llm_cache and isinstance(llm_cache[key], dict):
+        return {**current, **llm_cache[key], "llm_status": "cache_hit"}
+    try:
+        text = call_llm(api_key, build_prematch_prompt(home, away, raw_text, current), base_url, model, timeout)
+        payload = parse_json_object(text)
+    except Exception as exc:
+        return {**current, "llm_status": f"failed:{type(exc).__name__}"}
+    if not payload:
+        return {**current, "llm_status": "empty_response"}
+    merged = {**current}
+    text_keys = ("home_coach_style", "away_coach_style", "home_formation", "away_formation", "tactical_summary", "value_summary", "weather_summary")
+    numeric_keys = (
+        "home_pressing_level", "away_pressing_level", "home_defensive_line", "away_defensive_line",
+        "home_tactical_stability", "away_tactical_stability", "home_transition_risk", "away_transition_risk",
+        "tactical_mismatch_home", "tactical_mismatch_away", "home_squad_value_eur_m", "away_squad_value_eur_m",
+        "home_value_ratio", "away_value_ratio", "home_top_player_value_eur_m", "away_top_player_value_eur_m",
+        "home_core_player_count", "away_core_player_count", "home_big5_league_players", "away_big5_league_players",
+        "home_squad_depth_score", "away_squad_depth_score", "home_star_dependency", "away_star_dependency",
+        "home_absence_value_loss_eur_m", "away_absence_value_loss_eur_m", "player_value_mismatch_home", "player_value_mismatch_away",
+    )
+    for key_name in text_keys:
+        if payload.get(key_name) not in (None, ""):
+            merged[key_name] = payload[key_name]
+    for key_name in numeric_keys:
+        if key_name in payload:
+            try:
+                value = float(payload[key_name])
+                if key_name in {"home_pressing_level", "away_pressing_level", "home_defensive_line", "away_defensive_line", "home_tactical_stability", "away_tactical_stability", "home_transition_risk", "away_transition_risk", "tactical_mismatch_home", "tactical_mismatch_away", "home_squad_depth_score", "away_squad_depth_score", "home_star_dependency", "away_star_dependency", "player_value_mismatch_home", "player_value_mismatch_away"}:
+                    value = max(-1.0 if "mismatch" in key_name else 0.0, min(1.0, value))
+                merged[key_name] = value
+            except (TypeError, ValueError):
+                continue
+    merged["tactical_source"] = "keyword_rule_and_llm"
+    merged["value_source"] = "keyword_rule_and_llm"
+    merged["llm_status"] = "success"
+    if use_cache:
+        llm_cache[key] = {k: v for k, v in merged.items() if k not in current or current.get(k) != v}
     return merged
 
 
@@ -561,6 +655,9 @@ def analyze_qingbao(text: str, home: str, away: str) -> Dict[str, object]:
 def main() -> int:
     env = {**os.environ, **load_env(ROOT / ".env")}
     qingbao_base_url = env.get("QTX_QINGBAO_BASE_URL", DEFAULT_QTX_QINGBAO_BASE_URL)
+    use_source_cache = env.get("PREMATCH_SOURCE_CACHE", "1").lower() in {"1", "true", "yes", "on"}
+    source_cache = load_json_dict(SOURCE_CACHE_PATH)
+    llm_cache = load_json_dict(LLM_CACHE_PATH)
     profiles = load_team_value_profiles()
     weather_index = load_match_weather_index()
     snapshot = json.loads(latest_snapshot().read_text(encoding="utf-8"))
@@ -618,10 +715,26 @@ def main() -> int:
         }
         if token:
             try:
-                page = fetch(qingbao_url(token, qingbao_base_url))
+                source_key = cache_key(match_time, home, away, token)
+                cached_source = source_cache.get(source_key) if use_source_cache else None
+                if isinstance(cached_source, dict) and isinstance(cached_source.get("html"), str):
+                    page = str(cached_source["html"])
+                    entry["source_cache_status"] = "hit"
+                else:
+                    page = fetch(qingbao_url(token, qingbao_base_url))
+                    entry["source_cache_status"] = "miss"
+                    if use_source_cache:
+                        source_cache[source_key] = {
+                            "match_time": match_time,
+                            "home_team": home,
+                            "away_team": away,
+                            "token": token,
+                            "url": qingbao_url(token, qingbao_base_url),
+                            "html": page,
+                            "text": html_to_text(page),
+                        }
                 parsed = analyze_qingbao(page, home, away)
-                parsed = tactical_llm_enhancement(html_to_text(page), home, away, parsed, env)
-                parsed = value_llm_enhancement(html_to_text(page), home, away, parsed, env)
+                parsed = prematch_llm_enhancement(html_to_text(page), home, away, parsed, env, llm_cache)
                 entry.update(parsed)
             except Exception as exc:
                 entry["fetch_error"] = type(exc).__name__
@@ -631,6 +744,10 @@ def main() -> int:
         results.append(entry)
 
     OUT_PATH.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    if use_source_cache:
+        save_json_dict(SOURCE_CACHE_PATH, source_cache)
+    if env.get("PREMATCH_LLM_CACHE", "1").lower() in {"1", "true", "yes", "on"}:
+        save_json_dict(LLM_CACHE_PATH, llm_cache)
     print(f"Prematch news written: {OUT_PATH}")
     print(f"Matches exported: {len(results)}")
     print("Note: current prototype requires qtx_match_token in prediction snapshots for live fetch.")
