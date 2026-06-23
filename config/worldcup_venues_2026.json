@@ -1,4 +1,182 @@
 {
-  "_comment": "按 match_time + home_team + away_team 精确匹配比赛场地。请逐步补充 2026 世界杯赛程的球场、城市、经纬度与时区信息。",
+  "_comment": "2026 世界杯比赛场地配置。matches 数组按 match_time + home_team + away_team 精确匹配（待赛程确定后补充具体场次）。venues 数组为场地目录，可用于城市级场地回退匹配。",
+  "venues": [
+    {
+      "venue_name": "MetLife Stadium",
+      "venue_city": "东卢瑟福",
+      "venue_city_en": "East Rutherford",
+      "country": "美国",
+      "latitude": 40.8128,
+      "longitude": -74.0742,
+      "timezone": "America/New_York",
+      "indoor": false,
+      "capacity": 82500
+    },
+    {
+      "venue_name": "AT&T Stadium",
+      "venue_city": "阿灵顿",
+      "venue_city_en": "Arlington",
+      "country": "美国",
+      "latitude": 32.7473,
+      "longitude": -97.0945,
+      "timezone": "America/Chicago",
+      "indoor": true,
+      "capacity": 80000
+    },
+    {
+      "venue_name": "Mercedes-Benz Stadium",
+      "venue_city": "亚特兰大",
+      "venue_city_en": "Atlanta",
+      "country": "美国",
+      "latitude": 33.7555,
+      "longitude": -84.4011,
+      "timezone": "America/New_York",
+      "indoor": false,
+      "capacity": 71000
+    },
+    {
+      "venue_name": "NRG Stadium",
+      "venue_city": "休斯敦",
+      "venue_city_en": "Houston",
+      "country": "美国",
+      "latitude": 29.6847,
+      "longitude": -95.4107,
+      "timezone": "America/Chicago",
+      "indoor": true,
+      "capacity": 72000
+    },
+    {
+      "venue_name": "Gillette Stadium",
+      "venue_city": "福克斯堡",
+      "venue_city_en": "Foxborough",
+      "country": "美国",
+      "latitude": 42.0909,
+      "longitude": -71.2643,
+      "timezone": "America/New_York",
+      "indoor": false,
+      "capacity": 65000
+    },
+    {
+      "venue_name": "Lincoln Financial Field",
+      "venue_city": "费城",
+      "venue_city_en": "Philadelphia",
+      "country": "美国",
+      "latitude": 39.9008,
+      "longitude": -75.1674,
+      "timezone": "America/New_York",
+      "indoor": false,
+      "capacity": 67500
+    },
+    {
+      "venue_name": "Levi's Stadium",
+      "venue_city": "圣克拉拉",
+      "venue_city_en": "Santa Clara",
+      "country": "美国",
+      "latitude": 37.4030,
+      "longitude": -121.9696,
+      "timezone": "America/Los_Angeles",
+      "indoor": false,
+      "capacity": 68500
+    },
+    {
+      "venue_name": "SoFi Stadium",
+      "venue_city": "英格尔伍德",
+      "venue_city_en": "Inglewood",
+      "country": "美国",
+      "latitude": 33.9537,
+      "longitude": -118.3388,
+      "timezone": "America/Los_Angeles",
+      "indoor": true,
+      "capacity": 70240
+    },
+    {
+      "venue_name": "Arrowhead Stadium",
+      "venue_city": "堪萨斯城",
+      "venue_city_en": "Kansas City",
+      "country": "美国",
+      "latitude": 39.0489,
+      "longitude": -94.4839,
+      "timezone": "America/Chicago",
+      "indoor": false,
+      "capacity": 76000
+    },
+    {
+      "venue_name": "Lumen Field",
+      "venue_city": "西雅图",
+      "venue_city_en": "Seattle",
+      "country": "美国",
+      "latitude": 47.5952,
+      "longitude": -122.3316,
+      "timezone": "America/Los_Angeles",
+      "indoor": false,
+      "capacity": 69000
+    },
+    {
+      "venue_name": "Hard Rock Stadium",
+      "venue_city": "迈阿密花园",
+      "venue_city_en": "Miami Gardens",
+      "country": "美国",
+      "latitude": 25.9580,
+      "longitude": -80.2389,
+      "timezone": "America/New_York",
+      "indoor": false,
+      "capacity": 65000
+    },
+    {
+      "venue_name": "Estadio Azteca",
+      "venue_city": "墨西哥城",
+      "venue_city_en": "Mexico City",
+      "country": "墨西哥",
+      "latitude": 19.3029,
+      "longitude": -99.1504,
+      "timezone": "America/Mexico_City",
+      "indoor": false,
+      "capacity": 87000
+    },
+    {
+      "venue_name": "Estadio Akron",
+      "venue_city": "瓜达拉哈拉",
+      "venue_city_en": "Guadalajara",
+      "country": "墨西哥",
+      "latitude": 20.6918,
+      "longitude": -103.3370,
+      "timezone": "America/Mexico_City",
+      "indoor": false,
+      "capacity": 48000
+    },
+    {
+      "venue_name": "Estadio BBVA",
+      "venue_city": "蒙特雷",
+      "venue_city_en": "Monterrey",
+      "country": "墨西哥",
+      "latitude": 25.6684,
+      "longitude": -100.2022,
+      "timezone": "America/Monterrey",
+      "indoor": false,
+      "capacity": 53500
+    },
+    {
+      "venue_name": "BMO Field",
+      "venue_city": "多伦多",
+      "venue_city_en": "Toronto",
+      "country": "加拿大",
+      "latitude": 43.6233,
+      "longitude": -79.4170,
+      "timezone": "America/Toronto",
+      "indoor": false,
+      "capacity": 45000
+    },
+    {
+      "venue_name": "BC Place",
+      "venue_city": "温哥华",
+      "venue_city_en": "Vancouver",
+      "country": "加拿大",
+      "latitude": 49.2763,
+      "longitude": -123.1130,
+      "timezone": "America/Vancouver",
+      "indoor": true,
+      "capacity": 54500
+    }
+  ],
   "matches": []
 }

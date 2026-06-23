@@ -23,26 +23,39 @@ CITY_ALIASES = {
     "加利福尼亚州圣克拉拉": "Santa Clara",
     "圣克拉拉": "Santa Clara",
     "旧金山": "San Francisco",
+    "旧金山湾区": "Santa Clara",
+    "英格尔伍德": "Inglewood",
+    "洛杉矶": "Los Angeles",
     "达拉斯": "Dallas",
+    "阿灵顿": "Arlington",
     "亚特兰大": "Atlanta",
     "西雅图": "Seattle",
     "休斯敦": "Houston",
+    "休斯顿": "Houston",
     "迈阿密": "Miami",
+    "迈阿密花园": "Miami Gardens",
     "波士顿": "Boston",
+    "福克斯堡": "Foxborough",
     "蒙特雷": "Monterrey",
     "瓜达拉哈拉": "Guadalajara",
     "墨西哥城": "Mexico City",
     "温哥华": "Vancouver",
     "多伦多": "Toronto",
-    "洛杉矶": "Los Angeles",
     "堪萨斯城": "Kansas City",
     "费城": "Philadelphia",
     "新泽西": "East Rutherford",
+    "东卢瑟福": "East Rutherford",
+    "纽约": "East Rutherford",
 }
 VENUE_CITY_ALIASES = {
     "休斯敦体育场": "Houston",
+    "休斯顿体育场": "Houston",
     "瓜达拉哈拉体育场": "Guadalajara",
     "旧金山湾区体育场": "Santa Clara",
+    "阿兹特克体育场": "Mexico City",
+    "梅赛德斯体育场": "Atlanta",
+    "大都会体育场": "East Rutherford",
+    "AT&T体育场": "Arlington",
 }
 
 
@@ -53,25 +66,30 @@ def latest_snapshot() -> Path:
     return files[-1]
 
 
-def load_venue_config(path: Path = VENUE_CONFIG_PATH) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+def load_venue_config(path: Path = VENUE_CONFIG_PATH) -> Tuple[Dict[Tuple[str, str, str], Dict[str, Any]], List[Dict[str, Any]]]:
     if not path.exists():
-        return {}
+        return {}, []
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {}
+        return {}, []
     rows = payload.get("matches") if isinstance(payload, dict) else None
-    if not isinstance(rows, list):
-        return {}
+    venues = payload.get("venues") if isinstance(payload, dict) else None
     index: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        key = (str(row.get("match_time", "")), str(row.get("home_team", "")), str(row.get("away_team", "")))
-        if not all(key):
-            continue
-        index[key] = row
-    return index
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = (str(row.get("match_time", "")), str(row.get("home_team", "")), str(row.get("away_team", "")))
+            if not all(key):
+                continue
+            index[key] = row
+    catalog: List[Dict[str, Any]] = []
+    if isinstance(venues, list):
+        for venue in venues:
+            if isinstance(venue, dict) and venue.get("latitude") and venue.get("longitude"):
+                catalog.append(venue)
+    return index, catalog
 
 
 def fetch_json(url: str) -> Dict[str, Any]:
@@ -142,24 +160,49 @@ def geocode_city(city: str, base_url: str = DEFAULT_OPEN_METEO_GEOCODE_URL) -> O
     return lat, lon, timezone
 
 
-def resolve_venue_for_match(match: Dict[str, Any], configured: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def lookup_venue_by_city(city: str, catalog: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not city or not catalog:
+        return None
+    city_norm = city.strip()
+    city_en = CITY_ALIASES.get(city_norm, city_norm)
+    for venue in catalog:
+        if venue.get("venue_city_en", "").lower() == city_en.lower():
+            return venue
+        if venue.get("venue_city", "").strip() == city_norm:
+            return venue
+    for venue in catalog:
+        v_city_en = str(venue.get("venue_city_en", "")).lower()
+        v_city = str(venue.get("venue_city", ""))
+        if city_en.lower() in v_city_en or city_norm in v_city or v_city in city_norm:
+            return venue
+    return None
+
+
+def resolve_venue_for_match(
+    match: Dict[str, Any],
+    configured: Optional[Dict[str, Any]] = None,
+    catalog: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
     if configured:
         return configured
     token = str(match.get("qtx_match_token", ""))
-    if not token:
-        return None
-    try:
-        text = html_to_text(fetch_text(qingbao_url(token)))
-        venue_bits = parse_venue_from_text(text)
-    except Exception:
-        return None
-    if not venue_bits:
-        return None
-    geocoded = geocode_city(venue_bits.get("venue_city", ""))
-    if geocoded is None:
-        return {**venue_bits}
-    lat, lon, timezone = geocoded
-    return {**venue_bits, "latitude": lat, "longitude": lon, "timezone": timezone, "source": "qtx_qingbao_text"}
+    if token:
+        try:
+            text = html_to_text(fetch_text(qingbao_url(token)))
+            venue_bits = parse_venue_from_text(text)
+            if venue_bits:
+                geocoded = geocode_city(venue_bits.get("venue_city", ""))
+                if geocoded:
+                    lat, lon, timezone = geocoded
+                    return {**venue_bits, "latitude": lat, "longitude": lon, "timezone": timezone, "source": "qtx_qingbao_text"}
+                if catalog:
+                    cat_match = lookup_venue_by_city(venue_bits.get("venue_city", ""), catalog)
+                    if cat_match:
+                        return {**venue_bits, "latitude": cat_match["latitude"], "longitude": cat_match["longitude"], "timezone": cat_match.get("timezone", "auto"), "indoor": cat_match.get("indoor", False), "source": "qtx_qingbao_text+catalog"}
+                return {**venue_bits}
+        except Exception:
+            pass
+    return None
 
 
 def nearest_hourly_record(hourly: Dict[str, Any], kickoff: dt.datetime) -> Optional[Tuple[int, str]]:
@@ -290,14 +333,14 @@ def build_weather_entry(match: Dict[str, Any], venue: Dict[str, Any], base_url: 
 def main() -> int:
     snapshot = json.loads(latest_snapshot().read_text(encoding="utf-8"))
     matches = snapshot.get("matches", []) if isinstance(snapshot, dict) else []
-    venue_index = load_venue_config()
+    venue_index, venue_catalog = load_venue_config()
     results: List[Dict[str, Any]] = []
     hit = 0
     for match in matches:
         if not isinstance(match, dict):
             continue
         key = (str(match.get("match_time", "")), str(match.get("home", "")), str(match.get("away", "")))
-        venue = resolve_venue_for_match(match, venue_index.get(key))
+        venue = resolve_venue_for_match(match, venue_index.get(key), venue_catalog)
         if not venue:
             results.append({
                 "match_time": key[0],

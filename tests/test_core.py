@@ -28,7 +28,7 @@ from review_completed_matches import (  # noqa: E402
     top1_hit,
     top3_hit,
 )
-from fetch_match_weather import build_weather_entry, load_venue_config  # noqa: E402
+from fetch_match_weather import build_weather_entry, load_venue_config, lookup_venue_by_city  # noqa: E402
 from fetch_prematch_team_news import load_match_weather_index, merge_weather  # noqa: E402
 from worldcup_agent import (  # noqa: E402
     attach_odds_history,
@@ -213,7 +213,7 @@ class ReportFlowTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            venue_index = load_venue_config(config_path)
+            venue_index, venue_catalog = load_venue_config(config_path)
             self.assertIn(("2026-06-23 01:00", "阿根廷", "奥地利"), venue_index)
 
             weather_path = Path(tmpdir) / "weather.json"
@@ -238,6 +238,37 @@ class ReportFlowTests(unittest.TestCase):
             merge_weather(entry, weather_index[("2026-06-23 01:00", "阿根廷", "奥地利")])
             self.assertEqual(entry["temperature_c"], 29.5)
             self.assertEqual(entry["weather_source"], "open_meteo_forecast")
+
+    def test_venue_catalog_load_and_city_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "venues.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "venues": [
+                            {
+                                "venue_name": "Estadio Akron",
+                                "venue_city": "瓜达拉哈拉",
+                                "venue_city_en": "Guadalajara",
+                                "latitude": 20.69,
+                                "longitude": -103.34,
+                                "timezone": "America/Mexico_City",
+                            }
+                        ],
+                        "matches": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            venue_index, venue_catalog = load_venue_config(config_path)
+            self.assertEqual(len(venue_index), 0)
+            self.assertEqual(len(venue_catalog), 1)
+            result = lookup_venue_by_city("瓜达拉哈拉", venue_catalog)
+            self.assertIsNotNone(result)
+            self.assertAlmostEqual(result["latitude"], 20.69)
+            result_en = lookup_venue_by_city("Guadalajara", venue_catalog)
+            self.assertIsNotNone(result_en)
 
     def test_build_weather_entry_uses_hourly_forecast(self):
         from fetch_match_weather import fetch_json as _unused_fetch_json  # noqa: F401
