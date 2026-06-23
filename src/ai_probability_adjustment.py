@@ -47,6 +47,7 @@ def adjust_probabilities_with_ai_context(
     reasons: List[str] = []
     context_reasons: List[str] = []
     tactical_reasons: List[str] = []
+    weather_reasons: List[str] = []
     signal_strength = 0.0
 
     home_injury = _f(prematch, "home_injury_count")
@@ -76,6 +77,15 @@ def adjust_probabilities_with_ai_context(
     away_absence_loss = _f(prematch, "away_absence_value_loss_eur_m")
     value_mismatch_home = _f(prematch, "player_value_mismatch_home")
     value_mismatch_away = _f(prematch, "player_value_mismatch_away")
+    temperature_c = _f(prematch, "temperature_c")
+    humidity_pct = _f(prematch, "humidity_pct")
+    wind_kph = _f(prematch, "wind_kph")
+    precipitation_mm = _f(prematch, "precipitation_mm")
+    weather_severity = max(
+        _f(prematch, "weather_severity"),
+        1.0 if temperature_c >= 35.0 or wind_kph >= 35.0 or precipitation_mm >= 8.0 else 0.0,
+        0.7 if temperature_c >= 30.0 or humidity_pct >= 75.0 or wind_kph >= 25.0 or precipitation_mm >= 2.0 else 0.0,
+    )
     home_style = str(prematch.get("home_coach_style", "")) if prematch else ""
     away_style = str(prematch.get("away_coach_style", "")) if prematch else ""
 
@@ -158,6 +168,32 @@ def adjust_probabilities_with_ai_context(
     if market_probabilities and abs(probabilities[0] - market_probabilities[0]) >= 0.12 and lineup_known >= 1:
         reasons.append("赛前情报可用于修正模型与市场分歧")
         signal_strength += 0.005
+
+    weather_limit = min(float(risk_config.get("weather_adjustment_max_delta", 0.02)), max_delta)
+    weather_weight = float(risk_config.get("weather_adjustment_weight", 1.0))
+    if weather_severity > 0 and weather_limit > 0:
+        severity_scale = min(max(weather_severity, 0.0), 1.0)
+        draw_delta = min(weather_limit, 0.012 * severity_scale * max(weather_weight, 0.0))
+        if temperature_c >= 30.0 and humidity_pct >= 70.0:
+            draw_delta = min(weather_limit, draw_delta + 0.004 * max(weather_weight, 0.0))
+            weather_reasons.append("高温高湿压低比赛节奏")
+        elif temperature_c >= 30.0:
+            weather_reasons.append("高温增加体能消耗")
+        if wind_kph >= 25.0:
+            draw_delta = min(weather_limit, draw_delta + 0.004 * max(weather_weight, 0.0))
+            weather_reasons.append("强风影响传中和远射稳定性")
+        if precipitation_mm >= 2.0:
+            draw_delta = min(weather_limit, draw_delta + 0.004 * max(weather_weight, 0.0))
+            weather_reasons.append("降雨增加控球和防守失误波动")
+        if draw_delta > 0:
+            adjusted[1] += draw_delta
+            adjusted[0] -= draw_delta * 0.5
+            adjusted[2] -= draw_delta * 0.5
+            if not weather_reasons:
+                weather_reasons.append("天气条件偏不利进攻发挥")
+            reasons.append("天气因素提高小比分/平局权重")
+            context_reasons.extend(weather_reasons[:2])
+            signal_strength += draw_delta
 
     context_adjusted = _normalize((adjusted[0], adjusted[1], adjusted[2]))
     adjusted = list(context_adjusted)
@@ -301,6 +337,7 @@ def adjust_probabilities_with_ai_context(
         "applied": True,
         "base_probabilities": list(probabilities),
         "context_adjusted_probabilities": list(context_adjusted),
+        "weather_adjusted_probabilities": list(context_adjusted),
         "tactical_adjusted_probabilities": list(tactical_adjusted),
         "value_adjusted_probabilities": list(normalized),
         "adjusted_probabilities": list(normalized),
@@ -308,6 +345,8 @@ def adjust_probabilities_with_ai_context(
         "reasons": reasons,
         "context_reasons": context_reasons,
         "tactical_reasons": tactical_reasons,
+        "weather_reasons": weather_reasons,
+        "applied_weather": bool(weather_reasons),
         "applied_tactical": bool(tactical_reasons),
         "value_reasons": value_reasons,
         "applied_value": bool(value_reasons),

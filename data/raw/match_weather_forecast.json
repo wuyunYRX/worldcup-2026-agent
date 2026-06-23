@@ -1,0 +1,100 @@
+[
+  {
+    "match_time": "2026-06-23 23:00",
+    "home_team": "库普斯",
+    "away_team": "埃尔维斯",
+    "weather_source": "missing_venue_mapping",
+    "weather_status": "missing_venue",
+    "fetch_error": "missing_venue_mapping"
+  },
+  {
+    "match_time": "2026-06-23 23:00",
+    "home_team": "拉赫蒂",
+    "away_team": "图尔库",
+    "weather_source": "missing_venue_mapping",
+    "weather_status": "missing_venue",
+    "fetch_error": "missing_venue_mapping"
+  },
+  {
+    "match_time": "2026-06-23 23:00",
+    "home_team": "瓦萨",
+    "away_team": "奥卢",
+    "weather_source": "missing_venue_mapping",
+    "weather_status": "missing_venue",
+    "fetch_error": "missing_venue_mapping"
+  },
+  {
+    "match_time": "2026-06-24 00:00",
+    "home_team": "国际图尔",
+    "away_team": "塞纳乔琪",
+    "weather_source": "missing_venue_mapping",
+    "weather_status": "missing_venue",
+    "fetch_error": "missing_venue_mapping"
+  },
+  {
+    "match_time": "2026-06-24 00:00",
+    "home_team": "雅罗",
+    "away_team": "赫尔火花",
+    "weather_source": "missing_venue_mapping",
+    "weather_status": "missing_venue",
+    "fetch_error": "missing_venue_mapping"
+  },
+  {
+    "match_time": "2026-06-24 01:00",
+    "home_team": "玛丽港",
+    "away_team": "赫尔辛基",
+    "weather_source": "missing_venue_mapping",
+    "weather_status": "missing_venue",
+    "fetch_error": "missing_venue_mapping"
+  },
+  {
+    "match_time": "2026-06-24 01:00",
+    "home_team": "葡萄牙",
+    "away_team": "乌兹别克",
+    "venue_name": "休斯敦体育场",
+    "venue_city": "Houston",
+    "venue_timezone": "America/Chicago",
+    "venue_indoor": false,
+    "temperature_c": 0.0,
+    "humidity_pct": 0.0,
+    "wind_kph": 0.0,
+    "precipitation_mm": 0.0,
+    "weather_severity": 0.0,
+    "weather_summary": "已识别比赛场地：Houston 休斯敦体育场；天气暂不可用：forecast_not_available_yet",
+    "weather_source": "open_meteo_unavailable",
+    "weather_status": "forecast_not_available_yet"
+  },
+  {
+    "match_time": "2026-06-24 04:00",
+    "home_team": "英格兰",
+    "away_team": "加纳",
+    "weather_source": "missing_venue_mapping",
+    "weather_status": "missing_venue",
+    "fetch_error": "missing_venue_mapping"
+  },
+  {
+    "match_time": "2026-06-24 07:00",
+    "home_team": "巴拿马",
+    "away_team": "克罗地亚",
+    "weather_source": "missing_venue_mapping",
+    "weather_status": "missing_venue",
+    "fetch_error": "missing_venue_mapping"
+  },
+  {
+    "match_time": "2026-06-24 10:00",
+    "home_team": "哥伦比亚",
+    "away_team": "民主刚果",
+    "venue_name": "瓜达拉哈拉体育场",
+    "venue_city": "Guadalajara",
+    "venue_timezone": "America/Mexico_City",
+    "venue_indoor": false,
+    "temperature_c": 0.0,
+    "humidity_pct": 0.0,
+    "wind_kph": 0.0,
+    "precipitation_mm": 0.0,
+    "weather_severity": 0.0,
+    "weather_summary": "已识别比赛场地：Guadalajara 瓜达拉哈拉体育场；天气暂不可用：forecast_not_available_yet",
+    "weather_source": "open_meteo_unavailable",
+    "weather_status": "forecast_not_available_yet"
+  }
+]

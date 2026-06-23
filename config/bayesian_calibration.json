@@ -10,6 +10,7 @@
     "sample_size": 7,
     "base_model_accuracy": 0.5714285714285714,
     "context_model_accuracy": 0.5714285714285714,
+    "weather_model_accuracy": 0.5714285714285714,
     "tactical_model_accuracy": null,
     "value_model_accuracy": null,
     "model_accuracy": 0.5714285714285714,
@@ -18,12 +19,14 @@
     "model_brier": 0.6381142857142857,
     "base_model_brier": 0.6381142857142857,
     "context_model_brier": 0.6381142857142857,
+    "weather_model_brier": 0.6381142857142857,
     "tactical_model_brier": null,
     "value_model_brier": null,
     "market_brier": 0.8051552230735783,
     "fused_brier": 0.6577024539432713,
     "base_model_logloss": 1.0651810381981461,
     "context_model_logloss": 1.0651810381981461,
+    "weather_model_logloss": 1.0651810381981461,
     "tactical_model_logloss": null,
     "value_model_logloss": null,
     "model_logloss": 1.0651810381981461,
@@ -39,7 +42,86 @@
     "underestimated_draw_rate": 0.42857142857142855,
     "underestimated_underdog_goal_rate": 0.14285714285714285,
     "underestimated_big_win_rate": 0.14285714285714285,
-    "last_review_file": "postmatch-calibration_20260622_165227.json",
+    "mistake_tag_metrics": {
+      "sample_size": 7,
+      "counts": {
+        "draw_missed": 3,
+        "favorite_overestimated": 3,
+        "low_actual_outcome_probability": 2,
+        "overconfident_wrong_pick": 3,
+        "score_top3_miss": 6,
+        "very_low_actual_outcome_probability": 1,
+        "wdl_hit": 4,
+        "wdl_miss": 3
+      },
+      "rates": {
+        "draw_missed": 0.42857142857142855,
+        "favorite_overestimated": 0.42857142857142855,
+        "low_actual_outcome_probability": 0.2857142857142857,
+        "overconfident_wrong_pick": 0.42857142857142855,
+        "score_top3_miss": 0.8571428571428571,
+        "very_low_actual_outcome_probability": 0.14285714285714285,
+        "wdl_hit": 0.5714285714285714,
+        "wdl_miss": 0.42857142857142855
+      },
+      "labels_cn": {
+        "draw_missed": "平局漏判",
+        "favorite_overestimated": "高估热门方",
+        "low_actual_outcome_probability": "真实方向概率偏低",
+        "overconfident_wrong_pick": "高置信错误方向",
+        "score_top3_miss": "比分 Top3 未命中",
+        "very_low_actual_outcome_probability": "真实方向概率严重偏低",
+        "wdl_hit": "赛果方向命中",
+        "wdl_miss": "赛果方向未命中"
+      }
+    },
+    "adjustment_module_metrics": {
+      "context": {
+        "sample_size": 0,
+        "improved_actual_probability": 0,
+        "worsened_actual_probability": 0,
+        "unchanged_actual_probability": 0,
+        "fixed_top_outcome": 0,
+        "broke_top_outcome": 0,
+        "changed_top_outcome": 0,
+        "avg_actual_probability_delta": null,
+        "avg_abs_actual_probability_delta": null
+      },
+      "tactical": {
+        "sample_size": 0,
+        "improved_actual_probability": 0,
+        "worsened_actual_probability": 0,
+        "unchanged_actual_probability": 0,
+        "fixed_top_outcome": 0,
+        "broke_top_outcome": 0,
+        "changed_top_outcome": 0,
+        "avg_actual_probability_delta": null,
+        "avg_abs_actual_probability_delta": null
+      },
+      "value": {
+        "sample_size": 0,
+        "improved_actual_probability": 0,
+        "worsened_actual_probability": 0,
+        "unchanged_actual_probability": 0,
+        "fixed_top_outcome": 0,
+        "broke_top_outcome": 0,
+        "changed_top_outcome": 0,
+        "avg_actual_probability_delta": null,
+        "avg_abs_actual_probability_delta": null
+      },
+      "weather": {
+        "sample_size": 0,
+        "improved_actual_probability": 0,
+        "worsened_actual_probability": 0,
+        "unchanged_actual_probability": 0,
+        "fixed_top_outcome": 0,
+        "broke_top_outcome": 0,
+        "changed_top_outcome": 0,
+        "avg_actual_probability_delta": null,
+        "avg_abs_actual_probability_delta": null
+      }
+    },
+    "last_review_file": "postmatch-calibration_20260623_111449.json",
     "full_playback_sample_size": 40,
     "full_playback_model_accuracy": 0.675,
     "full_playback_model_brier": 0.520035,
@@ -49,6 +131,7 @@
     "ai_adjustment_decision": "ai_matches_base_keep_delta",
     "tactical_adjustment_decision": "missing_tactical_review_sample_keep",
     "value_adjustment_decision": "missing_value_review_sample_keep",
+    "weather_adjustment_decision": "missing_weather_review_sample_keep",
     "risk_adjustment_decision": "poor_short_sample_accuracy_reduce_kelly_raise_edge_keep_manual_total_stake",
     "probability_parameter_decision": "full_playback_keep_probability_parameters"
   },
@@ -64,5 +147,7 @@
   "tactical_adjustment_weight": 1.0,
   "tactical_adjustment_max_delta": 0.02,
   "value_adjustment_weight": 1.0,
-  "value_adjustment_max_delta": 0.025
+  "value_adjustment_max_delta": 0.025,
+  "weather_adjustment_max_delta": 0.02,
+  "weather_adjustment_weight": 1.0
 }

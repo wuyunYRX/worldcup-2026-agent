@@ -20,6 +20,7 @@ DEFAULT_QTX_QINGBAO_BASE_URL = "https://live.qtx.com/qingbao"
 DEFAULT_LLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_LLM_MODEL = "glm-4-flash"
 TEAM_VALUE_PROFILES_PATH = ROOT / "config" / "team_value_profiles.json"
+MATCH_WEATHER_PATH = ROOT / "data" / "raw" / "match_weather_forecast.json"
 
 INJURY_HINTS = ("伤停", "伤病", "缺阵", "伤缺", "受伤", "复出")
 SUSPENSION_HINTS = ("停赛", "禁赛", "红牌", "黄牌停赛")
@@ -34,6 +35,7 @@ DIRECT_HINTS = ("长传", "冲吊", "边路冲击", "快速推进")
 SET_PIECE_HINTS = ("定位球", "角球", "任意球", "高空球")
 FORMATION_HINTS = ("4-3-3", "4-2-3-1", "3-5-2", "5-4-1", "3-4-3", "4-4-2")
 VALUE_HINTS = ("总身价", "阵容总身价", "身价达", "身价≥", "来自五大联赛", "五大联赛")
+WEATHER_HINTS = ("天气", "气温", "温度", "高温", "湿度", "降雨", "下雨", "雨战", "强风", "风速")
 
 
 def post_json(api_key: str, url: str, payload: Dict[str, Any], timeout: int) -> Dict[str, Any]:
@@ -112,6 +114,52 @@ def load_team_value_profiles(path: Path = TEAM_VALUE_PROFILES_PATH) -> Dict[str,
     if not isinstance(payload, dict):
         return {}
     return {str(team): values for team, values in payload.items() if isinstance(values, dict)}
+
+
+def load_match_weather_index(path: Path = MATCH_WEATHER_PATH) -> Dict[tuple[str, str, str], Dict[str, object]]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, list):
+        return {}
+    result: Dict[tuple[str, str, str], Dict[str, object]] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        key = (str(item.get("match_time", "")), str(item.get("home_team", "")), str(item.get("away_team", "")))
+        if all(key):
+            result[key] = item
+    return result
+
+
+def merge_weather(entry: Dict[str, object], weather: Dict[str, object]) -> None:
+    if not isinstance(weather, dict):
+        return
+    has_numeric_weather = any(float(weather.get(field) or 0.0) for field in ("temperature_c", "humidity_pct", "wind_kph", "precipitation_mm", "weather_severity"))
+    has_existing_weather_summary = bool(entry.get("weather_summary"))
+    for field in (
+        "temperature_c",
+        "humidity_pct",
+        "wind_kph",
+        "precipitation_mm",
+        "weather_severity",
+        "weather_summary",
+        "weather_source",
+        "weather_status",
+        "venue_name",
+        "venue_city",
+        "venue_timezone",
+        "venue_indoor",
+    ):
+        value = weather.get(field)
+        if value in (None, "", 0.0, 0):
+            continue
+        if field in {"weather_summary", "weather_source"} and not has_numeric_weather and has_existing_weather_summary:
+            continue
+        entry[field] = value
 
 
 def latest_snapshot() -> Path:
@@ -426,6 +474,52 @@ def value_llm_enhancement(raw_text: str, home: str, away: str, current: Dict[str
     return merged
 
 
+def weather_summary_from_text(sentences: List[str]) -> Dict[str, object]:
+    weather_sentences = [sentence for sentence in sentences if any(hint in sentence for hint in WEATHER_HINTS)]
+    text_blob = " ".join(weather_sentences)
+
+    def first_number(patterns: List[str]) -> float:
+        for pattern in patterns:
+            match = re.search(pattern, text_blob)
+            if match:
+                try:
+                    return float(match.group(1))
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    temperature_c = first_number([r"(?:气温|温度|高温)[约为可达]*(\d+(?:\.\d+)?)\s*(?:℃|度)"])
+    humidity_pct = first_number([r"湿度[约为可达]*(\d+(?:\.\d+)?)\s*%"])
+    wind_kph = first_number([r"风速[约为可达]*(\d+(?:\.\d+)?)\s*(?:公里|km/h|kph)"])
+    precipitation_mm = first_number([r"降雨量[约为可达]*(\d+(?:\.\d+)?)\s*毫米", r"降水量[约为可达]*(\d+(?:\.\d+)?)\s*毫米"])
+    if not precipitation_mm and any(token in text_blob for token in ("降雨", "下雨", "雨战", "暴雨")):
+        precipitation_mm = 2.0
+    if not wind_kph and "强风" in text_blob:
+        wind_kph = 25.0
+    if not temperature_c and "高温" in text_blob:
+        temperature_c = 30.0
+
+    severity = 0.0
+    if temperature_c >= 35.0 or wind_kph >= 35.0 or precipitation_mm >= 8.0:
+        severity = 1.0
+    elif temperature_c >= 30.0 or humidity_pct >= 75.0 or wind_kph >= 25.0 or precipitation_mm >= 2.0:
+        severity = 0.7
+    summary = ""
+    if weather_sentences:
+        summary = "；".join(weather_sentences[:2])[:180]
+    elif severity > 0:
+        summary = "比赛天气存在不利因素"
+    return {
+        "temperature_c": round(temperature_c, 1),
+        "humidity_pct": round(humidity_pct, 1),
+        "wind_kph": round(wind_kph, 1),
+        "precipitation_mm": round(precipitation_mm, 1),
+        "weather_severity": round(severity, 2),
+        "weather_summary": summary,
+        "weather_source": "keyword_rule" if weather_sentences or severity > 0 else "none",
+    }
+
+
 def analyze_qingbao(text: str, home: str, away: str) -> Dict[str, object]:
     raw_text = html_to_text(text)
     sentences = [normalize(part) for part in re.split(r"[。！？\n]", raw_text) if normalize(part)]
@@ -445,6 +539,7 @@ def analyze_qingbao(text: str, home: str, away: str) -> Dict[str, object]:
     supporting = [s for s in sentences if any(h in s for h in INJURY_HINTS + SUSPENSION_HINTS + LINEUP_HINTS + ROTATION_HINTS + MUST_WIN_HINTS)][:12]
     tactical = tactical_feature_summary(sentences, home, away)
     value_summary = value_summary_from_text(sentences, home, away, load_team_value_profiles())
+    weather_summary = weather_summary_from_text(sentences)
     return {
         "home_injury_count": home_injury,
         "away_injury_count": away_injury,
@@ -459,6 +554,7 @@ def analyze_qingbao(text: str, home: str, away: str) -> Dict[str, object]:
         "supporting_sentences": supporting,
         **tactical,
         **value_summary,
+        **weather_summary,
     }
 
 
@@ -466,6 +562,7 @@ def main() -> int:
     env = {**os.environ, **load_env(ROOT / ".env")}
     qingbao_base_url = env.get("QTX_QINGBAO_BASE_URL", DEFAULT_QTX_QINGBAO_BASE_URL)
     profiles = load_team_value_profiles()
+    weather_index = load_match_weather_index()
     snapshot = json.loads(latest_snapshot().read_text(encoding="utf-8"))
     matches = snapshot.get("matches", [])
     results: List[Dict[str, object]] = []
@@ -507,6 +604,13 @@ def main() -> int:
             "tactical_mismatch_away": 0.0,
             "tactical_summary": "",
             "tactical_source": "none",
+            "temperature_c": 0.0,
+            "humidity_pct": 0.0,
+            "wind_kph": 0.0,
+            "precipitation_mm": 0.0,
+            "weather_severity": 0.0,
+            "weather_summary": "",
+            "weather_source": "none",
             **value_defaults,
             "source": "qtx_qingbao_prototype",
             "qtx_match_token": token,
@@ -523,6 +627,7 @@ def main() -> int:
                 entry["fetch_error"] = type(exc).__name__
         else:
             entry["fetch_error"] = "missing_qtx_match_token"
+        merge_weather(entry, weather_index.get((match_time, home, away), {}))
         results.append(entry)
 
     OUT_PATH.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -14,25 +14,40 @@ from ai_probability_adjustment import adjust_probabilities_with_ai_context  # no
 from kelly_criterion import fractional_kelly, kelly_fraction, kelly_stake  # noqa: E402
 from probability_fusion import fuse_wdl_probabilities, normalize_triplet  # noqa: E402
 from review_completed_matches import (  # noqa: E402
+    adjustment_module_metrics,
+    apply_weather_adjustment_tuning,
     brier,
     logloss,
     market_probs_from_odds,
+    mistake_tag_summary,
+    odds_movement_summary,
+    odds_outcome_cross_metrics,
+    outcome_mistake_tags,
     score_diagnosis,
     score_metric_summary,
     top1_hit,
     top3_hit,
 )
+from fetch_match_weather import build_weather_entry, load_venue_config  # noqa: E402
+from fetch_prematch_team_news import load_match_weather_index, merge_weather  # noqa: E402
 from worldcup_agent import (  # noqa: E402
+    attach_odds_history,
     asian_handicap_probabilities_from_score_grid,
     asian_handicap_return_units,
     asian_handicap_value_metrics,
     apply_value_metrics,
     build_group_standings,
+    safe_odds_triplet,
     build_team_aliases,
     calibrate_wdl_probabilities,
     filter_nearby_rows,
+    generate_report,
     handicap_probabilities_from_score_prediction,
+    load_calibration_snapshot,
+    load_risk_config,
     merge_candidate_rows,
+    monte_carlo_validate_score_prediction,
+    prematch_adjustments,
     parse_asian_handicap_source,
     parse_zgzcw_ypdb_market,
     parse_total_goals_source,
@@ -96,6 +111,54 @@ class CoreMathTests(unittest.TestCase):
         self.assertTrue(meta["applied_value"])
         self.assertGreater(probs[0], 0.45)
 
+    def test_ai_adjustment_raises_draw_for_bad_weather(self):
+        probs, meta = adjust_probabilities_with_ai_context(
+            (0.54, 0.24, 0.22),
+            {"temperature_c": 32, "humidity_pct": 80, "wind_kph": 28, "precipitation_mm": 3, "weather_summary": "高温高湿并伴有降雨和强风"},
+            {"enable_ai_probability_adjustment": 1.0, "ai_probability_max_delta": 0.03, "ai_probability_high_confidence_delta": 0.05, "weather_adjustment_max_delta": 0.02},
+        )
+        self.assertIsNotNone(probs)
+        self.assertTrue(meta["applied_weather"])
+        self.assertGreater(probs[1], 0.24)
+        self.assertAlmostEqual(sum(probs), 1.0)
+        self.assertIn("weather_adjusted_probabilities", meta)
+
+    def test_ai_adjustment_weather_weight_changes_delta(self):
+        low_weight_probs, _meta = adjust_probabilities_with_ai_context(
+            (0.54, 0.24, 0.22),
+            {"temperature_c": 32, "humidity_pct": 80, "wind_kph": 28, "precipitation_mm": 3},
+            {
+                "enable_ai_probability_adjustment": 1.0,
+                "ai_probability_max_delta": 0.03,
+                "ai_probability_high_confidence_delta": 0.05,
+                "weather_adjustment_max_delta": 0.02,
+                "weather_adjustment_weight": 0.5,
+            },
+        )
+        high_weight_probs, _meta = adjust_probabilities_with_ai_context(
+            (0.54, 0.24, 0.22),
+            {"temperature_c": 32, "humidity_pct": 80, "wind_kph": 28, "precipitation_mm": 3},
+            {
+                "enable_ai_probability_adjustment": 1.0,
+                "ai_probability_max_delta": 0.03,
+                "ai_probability_high_confidence_delta": 0.05,
+                "weather_adjustment_max_delta": 0.02,
+                "weather_adjustment_weight": 1.2,
+            },
+        )
+        self.assertIsNotNone(low_weight_probs)
+        self.assertIsNotNone(high_weight_probs)
+        self.assertGreater(high_weight_probs[1] - 0.24, low_weight_probs[1] - 0.24)
+
+    def test_prematch_adjustments_reduce_goal_expectation_for_bad_weather(self):
+        home_mul, away_mul, meta = prematch_adjustments(
+            {"temperature_c": 34, "humidity_pct": 82, "wind_kph": 30, "precipitation_mm": 4, "weather_summary": "高温高湿，风雨影响比赛节奏"}
+        )
+        self.assertLess(home_mul, 1.0)
+        self.assertLess(away_mul, 1.0)
+        self.assertGreater(meta["weather_severity"], 0.0)
+        self.assertEqual(meta["weather_summary"], "高温高湿，风雨影响比赛节奏")
+
     def test_review_metrics(self):
         probs = market_probs_from_odds([2.0, 4.0, 4.0])
         self.assertIsNotNone(probs)
@@ -126,6 +189,140 @@ class CoreMathTests(unittest.TestCase):
 
 
 class ReportFlowTests(unittest.TestCase):
+    def test_load_venue_config_and_match_weather_merge(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "venues.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "matches": [
+                            {
+                                "match_time": "2026-06-23 01:00",
+                                "home_team": "阿根廷",
+                                "away_team": "奥地利",
+                                "venue_name": "示例球场",
+                                "venue_city": "示例城市",
+                                "latitude": 31.0,
+                                "longitude": -97.0,
+                                "timezone": "America/Chicago",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            venue_index = load_venue_config(config_path)
+            self.assertIn(("2026-06-23 01:00", "阿根廷", "奥地利"), venue_index)
+
+            weather_path = Path(tmpdir) / "weather.json"
+            weather_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "match_time": "2026-06-23 01:00",
+                            "home_team": "阿根廷",
+                            "away_team": "奥地利",
+                            "temperature_c": 29.5,
+                            "weather_summary": "示例城市 2026-06-23T01:00 气温 29.5C",
+                            "weather_source": "open_meteo_forecast",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            weather_index = load_match_weather_index(weather_path)
+            entry = {"weather_source": "none", "weather_summary": ""}
+            merge_weather(entry, weather_index[("2026-06-23 01:00", "阿根廷", "奥地利")])
+            self.assertEqual(entry["temperature_c"], 29.5)
+            self.assertEqual(entry["weather_source"], "open_meteo_forecast")
+
+    def test_build_weather_entry_uses_hourly_forecast(self):
+        from fetch_match_weather import fetch_json as _unused_fetch_json  # noqa: F401
+
+        original = build_weather_entry.__globals__["fetch_json"]
+        try:
+            build_weather_entry.__globals__["fetch_json"] = lambda _url: {
+                "hourly": {
+                    "time": ["2026-06-23T01:00", "2026-06-23T02:00"],
+                    "temperature_2m": [31.2, 30.4],
+                    "relative_humidity_2m": [76, 72],
+                    "precipitation": [0.8, 0.0],
+                    "wind_speed_10m": [18.0, 12.0],
+                }
+            }
+            item = build_weather_entry(
+                {"match_time": "2026-06-23 01:00", "home": "阿根廷", "away": "奥地利"},
+                {"venue_name": "示例球场", "venue_city": "示例城市", "latitude": 31.0, "longitude": -97.0, "timezone": "America/Chicago"},
+            )
+        finally:
+            build_weather_entry.__globals__["fetch_json"] = original
+        self.assertEqual(item["home_team"], "阿根廷")
+        self.assertEqual(item["temperature_c"], 31.2)
+        self.assertEqual(item["weather_source"], "open_meteo_forecast")
+    def test_load_risk_config_and_calibration_snapshot_include_weather(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "risk.json"
+            path.write_text(json.dumps({"weather_adjustment_weight": 1.2, "weather_adjustment_max_delta": 0.018, "calibration": {"weather_model_accuracy": 0.61}}), encoding="utf-8")
+            risk = load_risk_config(path)
+            calibration = load_calibration_snapshot(path)
+        self.assertAlmostEqual(risk["weather_adjustment_weight"], 1.2)
+        self.assertAlmostEqual(risk["weather_adjustment_max_delta"], 0.018)
+        self.assertEqual(calibration["weather_model_accuracy"], 0.61)
+
+    def test_generate_report_contains_module_review_section(self):
+        report = generate_report([], "https://example.com", dt.datetime(2026, 6, 23, 12, 0), risk_config={"bankroll": 100.0, "kelly_fraction": 0.2})
+        self.assertIn("最近一次复盘模块效果", report)
+        self.assertIn("天气修正", report)
+        self.assertIn("战术修正", report)
+        self.assertIn("赔率变化", report)
+
+    def test_safe_odds_triplet_and_attach_history(self):
+        self.assertEqual(safe_odds_triplet(None), [0.0, 0.0, 0.0])
+        self.assertEqual(safe_odds_triplet([1.9, 3.2]), [1.9, 3.2, 0.0])
+        rows = [{"match_time": "2099-01-01 12:00", "home": "A", "away": "B", "normal_odds": [1.88, 3.20, 4.10]}]
+        attach_odds_history(rows, dt.datetime(2098, 12, 31, 12, 0))
+        self.assertIn("normal_odds_change", rows[0])
+        self.assertIn("summary", rows[0]["normal_odds_change"])
+
+    def test_odds_movement_summary_counts_shortening(self):
+        metrics = odds_movement_summary(
+            [
+                {"normal_odds_change": {"from_opening": [-0.10, 0.00, 0.12], "from_previous": [-0.05, 0.01, 0.00]}},
+                {"normal_odds_change": {"from_opening": [0.05, -0.08, -0.03], "from_previous": [0.02, -0.02, -0.01]}},
+            ]
+        )
+        self.assertEqual(metrics["from_opening"]["sample_size"], 2)
+        self.assertEqual(metrics["from_opening"]["home_shorter_count"], 1)
+        self.assertEqual(metrics["from_opening"]["draw_shorter_count"], 1)
+        self.assertEqual(metrics["from_opening"]["away_shorter_count"], 1)
+        self.assertEqual(metrics["from_previous"]["home_shorter_count"], 1)
+
+    def test_odds_outcome_cross_metrics(self):
+        metrics = odds_outcome_cross_metrics(
+            [
+                {
+                    "normal_odds_change": {"from_opening": [-0.10, 0.00, 0.12], "from_previous": [-0.05, 0.00, 0.02]},
+                    "actual_outcome_idx": 0,
+                    "model_top_outcome": "主胜",
+                    "model_probabilities": (0.55, 0.25, 0.20),
+                },
+                {
+                    "normal_odds_change": {"from_opening": [0.05, -0.08, -0.03], "from_previous": [0.00, -0.04, -0.01]},
+                    "actual_outcome_idx": 1,
+                    "model_top_outcome": "平",
+                    "model_probabilities": (0.30, 0.38, 0.32),
+                },
+            ]
+        )
+        self.assertEqual(metrics["from_opening"]["home"]["sample_size"], 1)
+        self.assertAlmostEqual(metrics["from_opening"]["home"]["actual_hit_rate"], 1.0)
+        self.assertEqual(metrics["from_opening"]["draw"]["sample_size"], 1)
+        self.assertAlmostEqual(metrics["from_opening"]["draw"]["model_pick_rate"], 1.0)
+        self.assertEqual(metrics["from_opening"]["away"]["sample_size"], 1)
+        self.assertEqual(metrics["from_previous"]["home"]["sample_size"], 1)
+
     def test_calibration_and_one_day_window(self):
         calibrated = calibrate_wdl_probabilities((0.70, 0.20, 0.10))
         self.assertAlmostEqual(calibrated[0], 0.62)
@@ -237,6 +434,38 @@ class ReportFlowTests(unittest.TestCase):
         self.assertEqual(len(ev), 2)
         self.assertEqual(len(kelly), 2)
 
+    def test_monte_carlo_validates_top5_to_top3(self):
+        prediction = {
+            "lambda_home": 1.8,
+            "lambda_away": 0.9,
+            "score_grid": [
+                (2, 0, 0.20),
+                (1, 0, 0.18),
+                (2, 1, 0.16),
+                (1, 1, 0.12),
+                (3, 0, 0.10),
+                (0, 0, 0.08),
+            ],
+        }
+        result = monte_carlo_validate_score_prediction(
+            prediction,
+            {
+                "monte_carlo_simulations": 500,
+                "monte_carlo_seed": 123,
+                "monte_carlo_lambda_sigma": 0.05,
+                "score_candidate_top_n": 5,
+                "score_report_top_n": 3,
+            },
+            target_probabilities=(0.58, 0.24, 0.18),
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result["candidate_top_scores"]), 5)
+        self.assertEqual(len(result["validated_top_scores"]), 3)
+        candidate_keys = {(home, away) for home, away, _prob in result["candidate_top_scores"]}
+        validated_keys = {(home, away) for home, away, _prob in result["validated_top_scores"]}
+        self.assertTrue(validated_keys.issubset(candidate_keys))
+        self.assertEqual(result["simulations"], 500)
+
     def test_parse_total_goals_json_source(self):
         aliases = build_team_aliases({("阿根廷", "奥地利"): (0.6, 0.2, 0.2)})
         text = json.dumps(
@@ -301,6 +530,87 @@ class ReportFlowTests(unittest.TestCase):
             standings, best_thirds = build_group_standings(path)
         self.assertEqual(standings[0]["team"], "墨西哥")
         self.assertEqual(best_thirds[0]["team"], "捷克")
+
+    def test_outcome_mistake_tags_identify_wrong_confident_pick(self):
+        tags = outcome_mistake_tags(
+            1,
+            (0.58, 0.24, 0.18),
+            base_probs=(0.54, 0.27, 0.19),
+            market_probs=(0.35, 0.34, 0.31),
+            score_top3_hit_value=False,
+            ai_adjustment={"applied_weather": True},
+        )
+        self.assertIn("wdl_miss", tags)
+        self.assertIn("overconfident_wrong_pick", tags)
+        self.assertIn("draw_missed", tags)
+        self.assertIn("ai_adjustment_hurt", tags)
+        self.assertIn("weather_adjustment_active", tags)
+
+    def test_mistake_and_module_summaries(self):
+        reviewed = [
+            {
+                "actual_outcome_idx": 1,
+                "mistake_tags": ["wdl_miss", "draw_missed", "ai_adjustment_helped"],
+                "base_model_probabilities": (0.50, 0.25, 0.25),
+                "context_adjusted_probabilities": (0.47, 0.29, 0.24),
+                "model_probabilities": (0.47, 0.29, 0.24),
+                "ai_adjustment": {"applied": True},
+                "applied_weather": True,
+            },
+            {
+                "actual_outcome_idx": 0,
+                "mistake_tags": ["wdl_hit"],
+                "base_model_probabilities": (0.55, 0.25, 0.20),
+                "context_adjusted_probabilities": (0.52, 0.28, 0.20),
+                "model_probabilities": (0.52, 0.28, 0.20),
+                "ai_adjustment": {"applied": True},
+            },
+        ]
+        tag_metrics = mistake_tag_summary(reviewed)
+        self.assertEqual(tag_metrics["counts"]["wdl_miss"], 1)
+        self.assertEqual(tag_metrics["counts"]["wdl_hit"], 1)
+        module_metrics = adjustment_module_metrics(reviewed)
+        self.assertEqual(module_metrics["context"]["sample_size"], 2)
+        self.assertEqual(module_metrics["context"]["improved_actual_probability"], 1)
+        self.assertEqual(module_metrics["context"]["worsened_actual_probability"], 1)
+        self.assertEqual(module_metrics["weather"]["sample_size"], 1)
+
+    def test_apply_weather_adjustment_tuning_expand_and_reduce(self):
+        expand_config = {"weather_adjustment_weight": 1.0, "weather_adjustment_max_delta": 0.02}
+        expand_summary = {
+            "adjustment_module_metrics": {
+                "weather": {
+                    "sample_size": 4,
+                    "improved_actual_probability": 3,
+                    "worsened_actual_probability": 1,
+                    "fixed_top_outcome": 2,
+                    "broke_top_outcome": 0,
+                    "avg_actual_probability_delta": 0.006,
+                }
+            }
+        }
+        decision = apply_weather_adjustment_tuning(expand_config, expand_summary)
+        self.assertEqual(decision, "weather_outperforms_expand")
+        self.assertGreater(expand_config["weather_adjustment_weight"], 1.0)
+        self.assertGreater(expand_config["weather_adjustment_max_delta"], 0.02)
+
+        reduce_config = {"weather_adjustment_weight": 1.0, "weather_adjustment_max_delta": 0.02}
+        reduce_summary = {
+            "adjustment_module_metrics": {
+                "weather": {
+                    "sample_size": 4,
+                    "improved_actual_probability": 1,
+                    "worsened_actual_probability": 3,
+                    "fixed_top_outcome": 0,
+                    "broke_top_outcome": 2,
+                    "avg_actual_probability_delta": -0.006,
+                }
+            }
+        }
+        decision = apply_weather_adjustment_tuning(reduce_config, reduce_summary)
+        self.assertEqual(decision, "weather_underperforms_reduce")
+        self.assertLess(reduce_config["weather_adjustment_weight"], 1.0)
+        self.assertLess(reduce_config["weather_adjustment_max_delta"], 0.02)
 
 
 if __name__ == "__main__":

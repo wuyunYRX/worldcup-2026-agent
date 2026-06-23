@@ -18,6 +18,7 @@ REVIEW_DOCS_DIR = ROOT / "docs" / "review"
 STATS_RESULTS_PATH = ROOT / "data" / "raw" / "statsbomb_matches_real.json"
 WC2026_RESULTS_PATH = ROOT / "data" / "raw" / "wc2026_football_data_matches.json"
 CALIBRATION_PATH = ROOT / "config" / "bayesian_calibration.json"
+PREMATCH_HISTORY_PATH = ROOT / "data" / "raw" / "prematch_team_news_history.json"
 OUTCOME_NAMES = ["主胜", "平", "客胜"]
 DIAGNOSIS_LABELS = {
     "underestimated_total_goals": "低估总进球",
@@ -28,14 +29,35 @@ DIAGNOSIS_LABELS = {
     "wrong_goal_diff_direction": "净胜球方向错误",
     "score_distribution_too_narrow": "比分分布过窄",
 }
+MISTAKE_TAG_LABELS = {
+    "wdl_hit": "赛果方向命中",
+    "wdl_miss": "赛果方向未命中",
+    "low_actual_outcome_probability": "真实方向概率偏低",
+    "very_low_actual_outcome_probability": "真实方向概率严重偏低",
+    "overconfident_wrong_pick": "高置信错误方向",
+    "favorite_overestimated": "高估热门方",
+    "draw_missed": "平局漏判",
+    "away_or_underdog_missed": "弱势/客队方向漏判",
+    "market_model_disagreement": "模型与市场主方向分歧",
+    "score_top3_miss": "比分 Top3 未命中",
+    "ai_adjustment_helped": "AI 修正提高真实方向概率",
+    "ai_adjustment_hurt": "AI 修正降低真实方向概率",
+    "weather_adjustment_active": "天气修正已触发",
+    "tactical_adjustment_active": "战术修正已触发",
+    "value_adjustment_active": "身价/阵容价值修正已触发",
+}
 
 from worldcup_agent import (  # noqa: E402
     calibrate_wdl_probabilities,
     estimate_match_probabilities,
     infer_team_strengths,
+    load_prematch_team_news,
     load_probability_model,
+    market_probabilities_from_odds,
+    normalize_text,
     score_prediction_from_wdl,
 )
+from ai_probability_adjustment import adjust_probabilities_with_ai_context  # noqa: E402
 
 EN_CN = {
     "Mexico": "墨西哥",
@@ -198,6 +220,71 @@ def load_probability_config() -> Dict[str, float]:
     return {}
 
 
+def load_combined_prematch_news_index() -> Dict[Tuple[str, str, str], Dict[str, object]]:
+    history_index = load_prematch_team_news(PREMATCH_HISTORY_PATH)
+    current_index = load_prematch_team_news(ROOT / "data" / "raw" / "prematch_team_news.json")
+    merged = dict(history_index)
+    merged.update(current_index)
+    return merged
+
+
+def rebuild_adjustment_fields(
+    prediction_row: Dict[str, object],
+    training_candidate_index: Dict[Tuple[str, str, str], Dict[str, object]],
+    prematch_news_index: Dict[Tuple[str, str, str], Dict[str, object]],
+    calibration_config: Dict[str, float],
+) -> Dict[str, object]:
+    base_probs = normalize_probs(prediction_row.get("base_probabilities"))
+    model_probs = normalize_probs(prediction_row.get("probabilities"))
+    if base_probs is None:
+        return prediction_row
+    key = (
+        normalize_text(str(prediction_row.get("match_time", ""))),
+        normalize_text(str(prediction_row.get("home", ""))),
+        normalize_text(str(prediction_row.get("away", ""))),
+    )
+    current_context = normalize_probs(prediction_row.get("context_adjusted_probabilities"))
+    current_tactical = normalize_probs(prediction_row.get("tactical_adjusted_probabilities"))
+    current_value = normalize_probs(prediction_row.get("value_adjusted_probabilities"))
+    current_weather = normalize_probs(prediction_row.get("weather_adjusted_probabilities"))
+    if current_context and current_tactical and current_value and current_weather:
+        return prediction_row
+    candidate_row = training_candidate_index.get((str(prediction_row.get("match_time", "")), str(prediction_row.get("home", "")), str(prediction_row.get("away", ""))))
+    if isinstance(candidate_row, dict):
+        candidate_context = normalize_probs(candidate_row.get("context_adjusted_probabilities"))
+        candidate_weather = normalize_probs(candidate_row.get("weather_adjusted_probabilities")) or candidate_context
+        candidate_tactical = normalize_probs(candidate_row.get("tactical_adjusted_probabilities"))
+        candidate_value = normalize_probs(candidate_row.get("value_adjusted_probabilities"))
+        candidate_ai_adjustment = candidate_row.get("ai_adjustment")
+        if any((candidate_context, candidate_weather, candidate_tactical, candidate_value)):
+            merged_adjustment = dict(prediction_row.get("ai_adjustment") or {})
+            if isinstance(candidate_ai_adjustment, dict):
+                merged_adjustment.update(candidate_ai_adjustment)
+            rebuilt = dict(prediction_row)
+            rebuilt["ai_adjustment"] = merged_adjustment
+            rebuilt["context_adjusted_probabilities"] = current_context or candidate_context or model_probs
+            rebuilt["weather_adjusted_probabilities"] = current_weather or candidate_weather or rebuilt["context_adjusted_probabilities"]
+            rebuilt["tactical_adjusted_probabilities"] = current_tactical or candidate_tactical
+            rebuilt["value_adjusted_probabilities"] = current_value or candidate_value
+            return rebuilt
+    prematch = prematch_news_index.get(key)
+    if not prematch:
+        return prediction_row
+    normal_odds_obj = prediction_row.get("normal_odds")
+    normal_odds = [float(value) for value in normal_odds_obj[:3]] if isinstance(normal_odds_obj, list) and len(normal_odds_obj) >= 3 else [0.0, 0.0, 0.0]
+    market_probs = market_probabilities_from_odds(normal_odds, base_probs)
+    _recalculated_probs, ai_adjustment = adjust_probabilities_with_ai_context(base_probs, prematch, calibration_config, market_probs)
+    merged_adjustment = dict(prediction_row.get("ai_adjustment") or {})
+    merged_adjustment.update(ai_adjustment)
+    rebuilt = dict(prediction_row)
+    rebuilt["ai_adjustment"] = merged_adjustment
+    rebuilt["context_adjusted_probabilities"] = merged_adjustment.get("context_adjusted_probabilities") or current_context or model_probs
+    rebuilt["weather_adjusted_probabilities"] = merged_adjustment.get("weather_adjusted_probabilities") or rebuilt["context_adjusted_probabilities"]
+    rebuilt["tactical_adjusted_probabilities"] = merged_adjustment.get("tactical_adjusted_probabilities") or current_tactical
+    rebuilt["value_adjusted_probabilities"] = merged_adjustment.get("value_adjusted_probabilities") or current_value or model_probs
+    return rebuilt
+
+
 def build_full_playback_samples(results: List[Dict[str, object]]) -> List[Dict[str, object]]:
     model_path = ROOT / "config" / "model_probabilities.json"
     if not model_path.exists():
@@ -244,6 +331,68 @@ def build_full_playback_samples(results: List[Dict[str, object]]) -> List[Dict[s
 
 def snapshot_files() -> List[Path]:
     return sorted(RUN_DOCS_DIR.glob("worldcup-2026-agent-predictions_*.json"))
+
+
+def training_candidate_files() -> List[Path]:
+    return sorted(RUN_DOCS_DIR.glob("worldcup-2026-agent-training-candidates_*.json"))
+
+
+def candidate_completeness_score(row: Dict[str, object]) -> int:
+    score = 0
+    for field in (
+        "context_adjusted_probabilities",
+        "weather_adjusted_probabilities",
+        "tactical_adjusted_probabilities",
+        "value_adjusted_probabilities",
+    ):
+        if normalize_probs(row.get(field)):
+            score += 1
+    adjustment = row.get("ai_adjustment")
+    if isinstance(adjustment, dict):
+        if adjustment.get("applied_tactical"):
+            score += 2
+        if adjustment.get("applied_value"):
+            score += 2
+        if adjustment.get("applied_weather"):
+            score += 1
+    return score
+
+
+def candidate_rank_tuple(row: Dict[str, object], generated_at: str) -> Tuple[int, int, str]:
+    match_dt = parse_local(str(row.get("match_time", "")))
+    generated_dt = parse_local(generated_at)
+    is_prematch = 1
+    if match_dt and generated_dt and generated_dt > match_dt:
+        is_prematch = 0
+    return (candidate_completeness_score(row), is_prematch, generated_at)
+
+
+def load_training_candidate_index() -> Dict[Tuple[str, str, str], Dict[str, object]]:
+    best: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+    for path in training_candidate_files():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        generated_text = str(payload.get("generated_at", ""))
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            match_time = str(row.get("match_time", ""))
+            home = str(row.get("home_team", ""))
+            away = str(row.get("away_team", ""))
+            key = (match_time, home, away)
+            if not all(key):
+                continue
+            current = best.get(key)
+            current_rank = candidate_rank_tuple(current, str(current.get("generated_at", ""))) if isinstance(current, dict) else (-1, -1, "")
+            row_rank = candidate_rank_tuple(row, generated_text)
+            if current is None or row_rank > current_rank:
+                best[key] = {**row, "snapshot": path.name, "generated_at": generated_text}
+    return best
 
 
 def load_snapshot_predictions() -> Dict[Tuple[str, str, str], Dict[str, object]]:
@@ -306,6 +455,18 @@ def brier(probabilities: Tuple[float, float, float], outcome_idx: int) -> float:
 
 def logloss(probabilities: Tuple[float, float, float], outcome_idx: int) -> float:
     return -math.log(max(probabilities[outcome_idx], 1e-12))
+
+
+def top_outcome_idx(probabilities: Optional[Tuple[float, float, float]]) -> Optional[int]:
+    if not probabilities:
+        return None
+    return max(range(3), key=lambda idx: probabilities[idx])
+
+
+def actual_probability(probabilities: Optional[Tuple[float, float, float]], outcome_idx: int) -> Optional[float]:
+    if not probabilities:
+        return None
+    return probabilities[outcome_idx]
 
 
 def top1_hit(prediction: Dict[str, object], actual_home: int, actual_away: int) -> bool:
@@ -460,6 +621,223 @@ def diagnosis_label_text(labels: object) -> str:
     return "、".join(DIAGNOSIS_LABELS.get(str(label), str(label)) for label in labels)
 
 
+def mistake_tag_text(labels: object) -> str:
+    if not isinstance(labels, list) or not labels:
+        return "无明显赛果错因标签"
+    return "、".join(MISTAKE_TAG_LABELS.get(str(label), str(label)) for label in labels)
+
+
+def outcome_mistake_tags(
+    outcome_idx: int,
+    model_probs: Optional[Tuple[float, float, float]],
+    base_probs: Optional[Tuple[float, float, float]] = None,
+    market_probs: Optional[Tuple[float, float, float]] = None,
+    score_top3_hit_value: bool = False,
+    ai_adjustment: Optional[Dict[str, object]] = None,
+) -> List[str]:
+    tags: List[str] = []
+    model_top = top_outcome_idx(model_probs)
+    if model_top == outcome_idx:
+        tags.append("wdl_hit")
+    else:
+        tags.append("wdl_miss")
+    actual_prob = actual_probability(model_probs, outcome_idx)
+    if actual_prob is not None:
+        if actual_prob < 0.20:
+            tags.append("very_low_actual_outcome_probability")
+        elif actual_prob < 0.30:
+            tags.append("low_actual_outcome_probability")
+    if model_probs and model_top is not None and model_top != outcome_idx and model_probs[model_top] >= 0.50:
+        tags.append("overconfident_wrong_pick")
+    if model_probs and model_top == 0 and outcome_idx != 0 and model_probs[0] >= 0.45:
+        tags.append("favorite_overestimated")
+    if outcome_idx == 1 and model_top != 1:
+        tags.append("draw_missed")
+    if outcome_idx == 2 and model_top != 2:
+        tags.append("away_or_underdog_missed")
+    market_top = top_outcome_idx(market_probs)
+    if model_top is not None and market_top is not None and model_top != market_top:
+        tags.append("market_model_disagreement")
+    if not score_top3_hit_value:
+        tags.append("score_top3_miss")
+    if base_probs and model_probs:
+        delta = model_probs[outcome_idx] - base_probs[outcome_idx]
+        if delta >= 0.005:
+            tags.append("ai_adjustment_helped")
+        elif delta <= -0.005:
+            tags.append("ai_adjustment_hurt")
+    adjustment = ai_adjustment or {}
+    if adjustment.get("applied_weather"):
+        tags.append("weather_adjustment_active")
+    if adjustment.get("applied_tactical"):
+        tags.append("tactical_adjustment_active")
+    if adjustment.get("applied_value"):
+        tags.append("value_adjustment_active")
+    return tags
+
+
+def mistake_tag_summary(reviewed: List[Dict[str, object]]) -> Dict[str, object]:
+    labels = [label for row in reviewed for label in row.get("mistake_tags", [])]
+    counts = {label: labels.count(label) for label in sorted(set(labels))}
+    return {
+        "sample_size": len(reviewed),
+        "counts": counts,
+        "rates": {label: (count / len(reviewed) if reviewed else 0.0) for label, count in counts.items()},
+        "labels_cn": {label: MISTAKE_TAG_LABELS.get(label, label) for label in counts},
+    }
+
+
+def adjustment_module_metrics(reviewed: List[Dict[str, object]]) -> Dict[str, object]:
+    modules = {
+        "context": ("base_model_probabilities", "context_adjusted_probabilities", "context_or_ai_adjustment"),
+        "tactical": ("context_adjusted_probabilities", "tactical_adjusted_probabilities", "applied_tactical"),
+        "value": ("tactical_adjusted_probabilities", "value_adjusted_probabilities", "applied_value"),
+        "weather": ("base_model_probabilities", "model_probabilities", "applied_weather"),
+    }
+    result: Dict[str, object] = {}
+    for name, (before_field, after_field, applied_field) in modules.items():
+        rows = []
+        for row in reviewed:
+            before = row.get(before_field)
+            after = row.get(after_field)
+            if not before or not after:
+                continue
+            if applied_field == "context_or_ai_adjustment":
+                adjustment = row.get("ai_adjustment") or {}
+                applied = bool(adjustment.get("applied")) if isinstance(adjustment, dict) else False
+            else:
+                applied = bool(row.get(applied_field))
+            if not applied:
+                continue
+            rows.append(row)
+        improved = 0
+        worsened = 0
+        unchanged = 0
+        fixed = 0
+        broke = 0
+        changed_top = 0
+        deltas: List[float] = []
+        for row in rows:
+            outcome_idx = int(row["actual_outcome_idx"])
+            before = row[before_field]
+            after = row[after_field]
+            before_actual = before[outcome_idx]
+            after_actual = after[outcome_idx]
+            delta = after_actual - before_actual
+            deltas.append(delta)
+            if delta > 1e-9:
+                improved += 1
+            elif delta < -1e-9:
+                worsened += 1
+            else:
+                unchanged += 1
+            before_top = top_outcome_idx(before)
+            after_top = top_outcome_idx(after)
+            if before_top != after_top:
+                changed_top += 1
+            if before_top != outcome_idx and after_top == outcome_idx:
+                fixed += 1
+            if before_top == outcome_idx and after_top != outcome_idx:
+                broke += 1
+        result[name] = {
+            "sample_size": len(rows),
+            "improved_actual_probability": improved,
+            "worsened_actual_probability": worsened,
+            "unchanged_actual_probability": unchanged,
+            "fixed_top_outcome": fixed,
+            "broke_top_outcome": broke,
+            "changed_top_outcome": changed_top,
+            "avg_actual_probability_delta": metric_summary(deltas),
+            "avg_abs_actual_probability_delta": metric_summary([abs(delta) for delta in deltas]),
+        }
+    return result
+
+
+def odds_movement_summary_for_source(reviewed: List[Dict[str, object]], source_key: str) -> Dict[str, object]:
+    rows = [row for row in reviewed if isinstance(row.get("normal_odds_change"), dict)]
+    changes_list = [row["normal_odds_change"].get(source_key, [0.0, 0.0, 0.0]) for row in rows]
+    return {
+        "sample_size": len(rows),
+        "home_shorter_count": sum(1 for change in changes_list if len(change) >= 1 and float(change[0] or 0.0) < 0),
+        "draw_shorter_count": sum(1 for change in changes_list if len(change) >= 2 and float(change[1] or 0.0) < 0),
+        "away_shorter_count": sum(1 for change in changes_list if len(change) >= 3 and float(change[2] or 0.0) < 0),
+        "avg_home_delta": metric_summary([float(change[0] or 0.0) for change in changes_list if len(change) >= 1]),
+        "avg_draw_delta": metric_summary([float(change[1] or 0.0) for change in changes_list if len(change) >= 2]),
+        "avg_away_delta": metric_summary([float(change[2] or 0.0) for change in changes_list if len(change) >= 3]),
+    }
+
+
+def odds_movement_summary(reviewed: List[Dict[str, object]]) -> Dict[str, object]:
+    return {
+        "from_opening": odds_movement_summary_for_source(reviewed, "from_opening"),
+        "from_previous": odds_movement_summary_for_source(reviewed, "from_previous"),
+    }
+
+
+def odds_outcome_cross_metrics_for_source(reviewed: List[Dict[str, object]], source_key: str) -> Dict[str, object]:
+    result: Dict[str, object] = {}
+    for idx, key in enumerate(("home", "draw", "away")):
+        rows = []
+        for row in reviewed:
+            change_info = row.get("normal_odds_change")
+            model_probs = row.get("model_probabilities")
+            if not isinstance(change_info, dict) or not model_probs:
+                continue
+            changes = change_info.get(source_key, [0.0, 0.0, 0.0])
+            if not isinstance(changes, list) or len(changes) <= idx:
+                continue
+            if float(changes[idx] or 0.0) < 0:
+                rows.append(row)
+        if not rows:
+            result[key] = {"sample_size": 0, "actual_hit_rate": None, "model_pick_rate": None, "avg_actual_probability": None}
+            continue
+        actual_hits = sum(1 for row in rows if int(row.get("actual_outcome_idx", -1)) == idx)
+        model_hits = sum(1 for row in rows if row.get("model_top_outcome") == OUTCOME_NAMES[idx])
+        actual_probs = [float((row.get("model_probabilities") or [0.0, 0.0, 0.0])[idx]) for row in rows]
+        result[key] = {
+            "sample_size": len(rows),
+            "actual_hit_rate": actual_hits / len(rows),
+            "model_pick_rate": model_hits / len(rows),
+            "avg_actual_probability": metric_summary(actual_probs),
+        }
+    return result
+
+
+def odds_outcome_cross_metrics(reviewed: List[Dict[str, object]]) -> Dict[str, object]:
+    return {
+        "from_opening": odds_outcome_cross_metrics_for_source(reviewed, "from_opening"),
+        "from_previous": odds_outcome_cross_metrics_for_source(reviewed, "from_previous"),
+    }
+
+
+def apply_weather_adjustment_tuning(config: Dict[str, object], summary: Dict[str, object]) -> str:
+    config.setdefault("weather_adjustment_weight", 1.0)
+    config.setdefault("weather_adjustment_max_delta", 0.02)
+    module_metrics = summary.get("adjustment_module_metrics", {}) if isinstance(summary.get("adjustment_module_metrics"), dict) else {}
+    weather_metrics = module_metrics.get("weather", {}) if isinstance(module_metrics.get("weather"), dict) else {}
+    sample_size = int(weather_metrics.get("sample_size", 0) or 0)
+    if sample_size < 3:
+        return "missing_weather_review_sample_keep"
+
+    improved = int(weather_metrics.get("improved_actual_probability", 0) or 0)
+    worsened = int(weather_metrics.get("worsened_actual_probability", 0) or 0)
+    fixed = int(weather_metrics.get("fixed_top_outcome", 0) or 0)
+    broke = int(weather_metrics.get("broke_top_outcome", 0) or 0)
+    avg_delta = float(weather_metrics.get("avg_actual_probability_delta", 0.0) or 0.0)
+    current_weight = float(config.get("weather_adjustment_weight", 1.0) or 1.0)
+    current_delta = float(config.get("weather_adjustment_max_delta", 0.02) or 0.02)
+
+    if improved > worsened and fixed >= broke and avg_delta >= 0.003:
+        config["weather_adjustment_weight"] = min(1.3, current_weight + 0.1)
+        config["weather_adjustment_max_delta"] = min(0.03, current_delta + 0.003)
+        return "weather_outperforms_expand"
+    if worsened > improved and (broke > fixed or avg_delta <= -0.003):
+        config["weather_adjustment_weight"] = max(0.7, current_weight - 0.1)
+        config["weather_adjustment_max_delta"] = max(0.01, current_delta - 0.003)
+        return "weather_underperforms_reduce"
+    return "weather_matches_keep"
+
+
 def probability_stats(reviewed: List[Dict[str, object]], field: str) -> Dict[str, object]:
     rows = [row for row in reviewed if row.get(field)]
     if not rows:
@@ -517,6 +895,26 @@ def build_advice(summary: Dict[str, object], reviewed: List[Dict[str, object]]) 
         advice.append("实际平局但模型主方向非平局的场次偏多，应继续观察并可能提高平局保护。")
     if score_metrics.get("underestimated_big_win_rate", 0.0) >= 0.20:
         advice.append("强队大胜或客队大胜尾部覆盖不足，应让深盘/强弱差更明显地影响比分尾部分布。")
+    mistake_metrics = summary.get("mistake_tag_metrics", {}) if isinstance(summary.get("mistake_tag_metrics"), dict) else {}
+    mistake_rates = mistake_metrics.get("rates", {}) if isinstance(mistake_metrics.get("rates"), dict) else {}
+    module_metrics = summary.get("adjustment_module_metrics", {}) if isinstance(summary.get("adjustment_module_metrics"), dict) else {}
+    odds_metrics_all = summary.get("odds_movement_metrics", {}) if isinstance(summary.get("odds_movement_metrics"), dict) else {}
+    odds_cross_all = summary.get("odds_outcome_cross_metrics", {}) if isinstance(summary.get("odds_outcome_cross_metrics"), dict) else {}
+    odds_metrics = odds_metrics_all.get("from_opening", {}) if isinstance(odds_metrics_all.get("from_opening"), dict) else {}
+    odds_cross = odds_cross_all.get("from_opening", {}) if isinstance(odds_cross_all.get("from_opening"), dict) else {}
+    if mistake_rates.get("overconfident_wrong_pick", 0.0) >= 0.20:
+        advice.append("高置信错误方向占比较高，建议降低强队方向集中度并提高冷门/平局尾部保护。")
+    if mistake_rates.get("ai_adjustment_hurt", 0.0) > mistake_rates.get("ai_adjustment_helped", 0.0):
+        advice.append("AI 修正降低真实方向概率的场次多于提高场次，应收紧赛前情报修正上限并复查触发原因。")
+    if odds_metrics.get("sample_size") and odds_metrics.get("home_shorter_count", 0) >= max(2, len(reviewed) // 3):
+        advice.append("主胜赔率临近比赛前被持续压低的场次较多，后续应重点观察强队方向是否被市场提前定价。")
+    home_cross = odds_cross.get("home", {}) if isinstance(odds_cross.get("home"), dict) else {}
+    if home_cross.get("sample_size") and home_cross.get("actual_hit_rate") is not None and home_cross.get("actual_hit_rate", 0.0) >= 0.6:
+        advice.append("主胜赔率走低的场次里主胜命中率偏高，可继续观察市场压低主胜时是否值得提高强队方向关注度。")
+    for module_name, label in (("weather", "天气"), ("tactical", "战术"), ("value", "身价/阵容价值")):
+        module = module_metrics.get(module_name, {}) if isinstance(module_metrics.get(module_name), dict) else {}
+        if module.get("sample_size") and module.get("worsened_actual_probability", 0) > module.get("improved_actual_probability", 0):
+            advice.append(f"{label}修正降低真实方向概率的样本更多，后续应降低该模块权重或提高触发阈值。")
     upsets = [row for row in reviewed if row.get("model_probabilities") and row["model_probabilities"][int(row["actual_outcome_idx"])] < 0.25]
     if len(upsets) >= max(2, len(reviewed) // 3):
         advice.append("冷门或模型低估方向占比较高，建议在下一轮预测中降低强队方向集中度，并提高平局/客胜尾部概率。")
@@ -543,6 +941,7 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
     model_stats = probability_metrics["model"]
     base_stats = probability_metrics.get("base", {})
     context_stats = probability_metrics.get("context", {})
+    weather_stats = probability_metrics.get("weather", {})
     tactical_stats = probability_metrics.get("tactical", {})
     value_stats = probability_metrics.get("value", {})
     market_stats = probability_metrics["market"]
@@ -560,11 +959,14 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
     config.setdefault("enable_ai_probability_adjustment", 1.0)
     config.setdefault("ai_probability_max_delta", 0.03)
     config.setdefault("ai_probability_high_confidence_delta", 0.05)
+    config.setdefault("weather_adjustment_weight", 1.0)
+    config.setdefault("weather_adjustment_max_delta", 0.02)
 
     config["calibration"] = {
         "sample_size": sample_size,
         "base_model_accuracy": base_stats.get("accuracy"),
         "context_model_accuracy": context_stats.get("accuracy"),
+        "weather_model_accuracy": weather_stats.get("accuracy"),
         "tactical_model_accuracy": tactical_stats.get("accuracy"),
         "value_model_accuracy": value_stats.get("accuracy"),
         "model_accuracy": model_stats["accuracy"],
@@ -573,12 +975,14 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         "model_brier": model_stats["brier"],
         "base_model_brier": base_stats.get("brier"),
         "context_model_brier": context_stats.get("brier"),
+        "weather_model_brier": weather_stats.get("brier"),
         "tactical_model_brier": tactical_stats.get("brier"),
         "value_model_brier": value_stats.get("brier"),
         "market_brier": market_stats["brier"],
         "fused_brier": fused_stats["brier"],
         "base_model_logloss": base_stats.get("logloss"),
         "context_model_logloss": context_stats.get("logloss"),
+        "weather_model_logloss": weather_stats.get("logloss"),
         "tactical_model_logloss": tactical_stats.get("logloss"),
         "value_model_logloss": value_stats.get("logloss"),
         "model_logloss": model_stats["logloss"],
@@ -594,6 +998,8 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         "underestimated_draw_rate": summary["score_metrics"].get("underestimated_draw_rate"),
         "underestimated_underdog_goal_rate": summary["score_metrics"].get("underestimated_underdog_goal_rate"),
         "underestimated_big_win_rate": summary["score_metrics"].get("underestimated_big_win_rate"),
+        "mistake_tag_metrics": summary.get("mistake_tag_metrics"),
+        "adjustment_module_metrics": summary.get("adjustment_module_metrics"),
         "last_review_file": summary["review_file"],
     }
     if full_playback:
@@ -666,6 +1072,8 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
     else:
         config["calibration"]["value_adjustment_decision"] = "missing_value_review_sample_keep"
 
+    config["calibration"]["weather_adjustment_decision"] = apply_weather_adjustment_tuning(config, summary)
+
     avg_actual_prob = model_stats.get("avg_actual_prob")
     top3_rate = summary["score_metrics"].get("top3_hit_rate")
     if sample_size > 0 and ((avg_actual_prob is not None and avg_actual_prob < 0.45) or (top3_rate is not None and top3_rate < 0.35)):
@@ -703,16 +1111,22 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         "tactical_adjustment_max_delta": config.get("tactical_adjustment_max_delta"),
         "value_adjustment_weight": config.get("value_adjustment_weight"),
         "value_adjustment_max_delta": config.get("value_adjustment_max_delta"),
+        "weather_adjustment_weight": config.get("weather_adjustment_weight"),
+        "weather_adjustment_max_delta": config.get("weather_adjustment_max_delta"),
     }
     summary["calibration_ai_decision"] = config["calibration"].get("ai_adjustment_decision")
     summary["calibration_tactical_decision"] = config["calibration"].get("tactical_adjustment_decision")
     summary["calibration_value_decision"] = config["calibration"].get("value_adjustment_decision")
+    summary["calibration_weather_decision"] = config["calibration"].get("weather_adjustment_decision")
 
 
 def write_reflection_report(summary: Dict[str, object]) -> Path:
     path = REVIEW_DOCS_DIR / summary["review_file"].replace("postmatch-calibration_", "postmatch-reflection_").replace(".json", ".md")
     model_stats = summary["probability_metrics"]["model"]
     fused_stats = summary["probability_metrics"]["fused"]
+    weather_stats = summary["probability_metrics"].get("weather", {})
+    tactical_stats = summary["probability_metrics"].get("tactical", {})
+    value_stats = summary["probability_metrics"].get("value", {})
     lines = [
         "# 赛后准确率校准与反思",
         "",
@@ -730,6 +1144,12 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
         f"- 模型 Brier：{model_stats['brier']:.4f}" if model_stats["brier"] is not None else "- 模型 Brier：暂无",
         f"- AI 修正前 Brier：{summary['probability_metrics']['base']['brier']:.4f}" if summary['probability_metrics']['base']['brier'] is not None else "- AI 修正前 Brier：暂无",
         f"- 融合 Brier：{fused_stats['brier']:.4f}" if fused_stats["brier"] is not None else "- 融合 Brier：暂无",
+        "",
+        "## 1.0 模块独立概率指标",
+        "",
+        f"- 天气修正：准确率 {weather_stats.get('accuracy'):.1%}，Brier {weather_stats.get('brier'):.4f}，logloss {weather_stats.get('logloss'):.4f}" if weather_stats.get("accuracy") is not None and weather_stats.get("brier") is not None and weather_stats.get("logloss") is not None else "- 天气修正：暂无独立样本。",
+        f"- 战术修正：准确率 {tactical_stats.get('accuracy'):.1%}，Brier {tactical_stats.get('brier'):.4f}，logloss {tactical_stats.get('logloss'):.4f}" if tactical_stats.get("accuracy") is not None and tactical_stats.get("brier") is not None and tactical_stats.get("logloss") is not None else "- 战术修正：暂无独立样本。",
+        f"- 身价/阵容价值修正：准确率 {value_stats.get('accuracy'):.1%}，Brier {value_stats.get('brier'):.4f}，logloss {value_stats.get('logloss'):.4f}" if value_stats.get("accuracy") is not None and value_stats.get("brier") is not None and value_stats.get("logloss") is not None else "- 身价/阵容价值修正：暂无独立样本。",
         "",
         "## 1.1 全量已完赛回放校准",
         "",
@@ -749,17 +1169,82 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
         f"- 低估弱队进球：{summary['score_metrics'].get('underestimated_underdog_goal_rate', 0.0):.1%}",
         f"- 低估大胜：{summary['score_metrics'].get('underestimated_big_win_rate', 0.0):.1%}",
         "",
-        "## 2. 单场复盘",
+        "## 1.3 赛果错因标签",
         "",
     ]
+    mistake_metrics = summary.get("mistake_tag_metrics", {}) if isinstance(summary.get("mistake_tag_metrics"), dict) else {}
+    mistake_counts = mistake_metrics.get("counts", {}) if isinstance(mistake_metrics.get("counts"), dict) else {}
+    mistake_rates = mistake_metrics.get("rates", {}) if isinstance(mistake_metrics.get("rates"), dict) else {}
+    if mistake_counts:
+        for label, count in sorted(mistake_counts.items(), key=lambda item: (-int(item[1]), str(item[0])))[:8]:
+            lines.append(f"- {MISTAKE_TAG_LABELS.get(str(label), str(label))}：{count} 场，占比 {float(mistake_rates.get(label, 0.0)):.1%}")
+    else:
+        lines.append("- 暂无赛果错因标签。")
+    lines.extend(
+        [
+            "",
+            "## 1.4 修正模块效果",
+            "",
+        ]
+    )
+    module_metrics = summary.get("adjustment_module_metrics", {}) if isinstance(summary.get("adjustment_module_metrics"), dict) else {}
+    module_labels = {"context": "赛前情报", "tactical": "战术", "value": "身价/阵容价值", "weather": "天气"}
+    for module_name in ("context", "tactical", "value", "weather"):
+        module = module_metrics.get(module_name, {}) if isinstance(module_metrics.get(module_name), dict) else {}
+        if not module or not module.get("sample_size"):
+            lines.append(f"- {module_labels[module_name]}修正：暂无触发样本。")
+            continue
+        avg_delta = module.get("avg_actual_probability_delta")
+        delta_text = f"，真实方向平均概率变化 {avg_delta:+.2%}" if avg_delta is not None else ""
+        lines.append(
+            f"- {module_labels[module_name]}修正：样本 {module.get('sample_size')} 场，"
+            f"提高 {module.get('improved_actual_probability')} 场，降低 {module.get('worsened_actual_probability')} 场，"
+            f"修正主方向 {module.get('fixed_top_outcome')} 场，破坏主方向 {module.get('broke_top_outcome')} 场{delta_text}。"
+        )
+    odds_metrics_all = summary.get("odds_movement_metrics", {}) if isinstance(summary.get("odds_movement_metrics"), dict) else {}
+    odds_cross_all = summary.get("odds_outcome_cross_metrics", {}) if isinstance(summary.get("odds_outcome_cross_metrics"), dict) else {}
+    lines.extend(
+        [
+            "",
+            "## 1.5 赔率变化摘要",
+            "",
+            f"- 初盘→当前盘：样本 {(odds_metrics_all.get('from_opening') or {}).get('sample_size', 0)} 场；主胜走低 {(odds_metrics_all.get('from_opening') or {}).get('home_shorter_count', 0)} 场，平局走低 {(odds_metrics_all.get('from_opening') or {}).get('draw_shorter_count', 0)} 场，客胜走低 {(odds_metrics_all.get('from_opening') or {}).get('away_shorter_count', 0)} 场。",
+            f"- 上一版→当前盘：样本 {(odds_metrics_all.get('from_previous') or {}).get('sample_size', 0)} 场；主胜走低 {(odds_metrics_all.get('from_previous') or {}).get('home_shorter_count', 0)} 场，平局走低 {(odds_metrics_all.get('from_previous') or {}).get('draw_shorter_count', 0)} 场，客胜走低 {(odds_metrics_all.get('from_previous') or {}).get('away_shorter_count', 0)} 场。",
+        ]
+    )
+    outcome_labels = {"home": "主胜赔率走低", "draw": "平局赔率走低", "away": "客胜赔率走低"}
+    lines.extend(["", "## 1.6 赔率变化 × 命中率交叉统计", ""])
+    source_labels = {"from_opening": "初盘→当前盘", "from_previous": "上一版→当前盘"}
+    for source_key in ("from_opening", "from_previous"):
+        lines.append(f"- {source_labels[source_key]}：")
+        source_cross = odds_cross_all.get(source_key, {}) if isinstance(odds_cross_all.get(source_key), dict) else {}
+        for key in ("home", "draw", "away"):
+            cross = source_cross.get(key, {}) if isinstance(source_cross.get(key), dict) else {}
+            if not cross or not cross.get("sample_size"):
+                lines.append(f"  {outcome_labels[key]}：暂无样本。")
+                continue
+            lines.append(
+                f"  {outcome_labels[key]}：样本 {cross.get('sample_size')} 场，"
+                f"对应真实方向命中率 {float(cross.get('actual_hit_rate', 0.0)):.1%}，"
+                f"模型主方向命中率 {float(cross.get('model_pick_rate', 0.0)):.1%}，"
+                f"真实方向平均概率 {float(cross.get('avg_actual_probability', 0.0)):.1%}。"
+            )
+    lines.extend(
+        [
+            "",
+        "## 2. 单场复盘",
+        "",
+        ]
+    )
     for row in summary["matches"]:
         model_probs = row.get("model_probabilities") or [0.0, 0.0, 0.0]
         predicted = row.get("model_top_outcome") or "未知"
         diagnosis_text = diagnosis_label_text(row.get("score_diagnosis"))
+        mistake_text = mistake_tag_text(row.get("mistake_tags"))
         lines.append(
             f"- {row['match_time']} {row['home']} vs {row['away']}：实际 {row['actual_score']}（{row['actual_outcome']}），"
             f"模型主方向 {predicted}，AI前主方向 {row.get('base_model_top_outcome') or '未知'}，真实方向概率 {model_probs[int(row['actual_outcome_idx'])]:.1%}，"
-            f"比分 Top3 命中：{'是' if row['top3_hit'] else '否'}；诊断：{diagnosis_text}。"
+            f"比分 Top3 命中：{'是' if row['top3_hit'] else '否'}；比分诊断：{diagnosis_text}；赛果错因：{mistake_text}。"
         )
     lines.extend(
         [
@@ -770,6 +1255,7 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
             f"- AI 修正幅度调优：{summary.get('calibration_ai_decision', 'keep_current_ai_delta')}；当前普通修正上限 {summary['risk_config'].get('ai_probability_max_delta', 0.03):.3f}，高置信度上限 {summary['risk_config'].get('ai_probability_high_confidence_delta', 0.05):.3f}。",
             f"- 战术修正调优：{summary.get('calibration_tactical_decision', 'keep_current_tactical_delta')}；当前战术权重 {summary['risk_config'].get('tactical_adjustment_weight', 1.0):.2f}，战术修正上限 {summary['risk_config'].get('tactical_adjustment_max_delta', 0.02):.3f}。",
             f"- 价值修正调优：{summary.get('calibration_value_decision', 'keep_current_value_delta')}；当前价值权重 {summary['risk_config'].get('value_adjustment_weight', 1.0):.2f}，价值修正上限 {summary['risk_config'].get('value_adjustment_max_delta', 0.025):.3f}。",
+            f"- 天气修正调优：{summary.get('calibration_weather_decision', 'keep_current_weather_delta')}；当前天气权重 {summary['risk_config'].get('weather_adjustment_weight', 1.0):.2f}，天气修正上限 {summary['risk_config'].get('weather_adjustment_max_delta', 0.02):.3f}。",
             f"- 本轮样本只有 {summary['reviewed_matches']} 场，不调整模型/市场融合权重；只做短期风控收紧。",
             f"- 已将 Kelly 从 1/4 降到不高于 1/5，并将最小 EV 门槛提高到 7%；总投入上限保留为 {summary['risk_config']['max_total_stake']:.0f} 元。",
             "",
@@ -789,6 +1275,9 @@ def main() -> int:
     predictions = load_snapshot_predictions()
     results = load_results()
     full_playback = build_full_playback_samples(results)
+    training_candidate_index = load_training_candidate_index()
+    prematch_news_index = load_combined_prematch_news_index()
+    calibration_config = load_probability_config()
     reviewed = []
     exact_hits = 0
     top3_hits = 0
@@ -798,6 +1287,7 @@ def main() -> int:
         prediction_row = predictions.get(key)
         if not prediction_row:
             continue
+        prediction_row = rebuild_adjustment_fields(prediction_row, training_candidate_index, prematch_news_index, calibration_config)
         actual_home = int(actual.get("home_goals", 0))
         actual_away = int(actual.get("away_goals", 0))
         outcome_idx = actual_outcome(actual_home, actual_away)
@@ -809,11 +1299,21 @@ def main() -> int:
         model_probs = normalize_probs(prediction_row.get("probabilities"))
         base_probs = normalize_probs(prediction_row.get("base_probabilities")) or model_probs
         context_probs = normalize_probs(prediction_row.get("context_adjusted_probabilities")) or model_probs
+        weather_probs = normalize_probs(prediction_row.get("weather_adjusted_probabilities")) or context_probs or model_probs
         tactical_probs = normalize_probs(prediction_row.get("tactical_adjusted_probabilities"))
         value_probs = normalize_probs(prediction_row.get("value_adjusted_probabilities"))
         market_probs = normalize_probs(prediction_row.get("market_probabilities")) or market_probs_from_odds(prediction_row.get("normal_odds"))
         fused_probs = normalize_probs(prediction_row.get("fused_probabilities")) or model_probs
         diagnosis = score_diagnosis(prediction, actual_home, actual_away, model_probs)
+        ai_adjustment = prediction_row.get("ai_adjustment") or {}
+        mistake_tags = outcome_mistake_tags(
+            outcome_idx,
+            model_probs,
+            base_probs=base_probs,
+            market_probs=market_probs,
+            score_top3_hit_value=top3,
+            ai_adjustment=ai_adjustment,
+        )
         reviewed.append(
             {
                 "match_time": actual.get("match_time", ""),
@@ -826,13 +1326,18 @@ def main() -> int:
                 "generated_at": prediction_row.get("generated_at", ""),
                 "base_model_probabilities": base_probs,
                 "context_adjusted_probabilities": context_probs,
+                "weather_adjusted_probabilities": weather_probs,
                 "tactical_adjusted_probabilities": tactical_probs,
                 "value_adjusted_probabilities": value_probs,
                 "model_probabilities": model_probs,
                 "market_probabilities": market_probs,
                 "fused_probabilities": fused_probs,
-                "ai_adjustment": prediction_row.get("ai_adjustment") or {},
-                "applied_tactical": bool((prediction_row.get("ai_adjustment") or {}).get("applied_tactical")),
+                "normal_odds_change": prediction_row.get("normal_odds_change"),
+                "ai_adjustment": ai_adjustment,
+                "applied_tactical": bool(ai_adjustment.get("applied_tactical")),
+                "applied_value": bool(ai_adjustment.get("applied_value")),
+                "applied_weather": bool(ai_adjustment.get("applied_weather")),
+                "mistake_tags": mistake_tags,
                 "base_model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: base_probs[idx])] if base_probs else None,
                 "context_model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: context_probs[idx])] if context_probs else None,
                 "tactical_model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: tactical_probs[idx])] if tactical_probs else None,
@@ -857,6 +1362,7 @@ def main() -> int:
         "probability_metrics": {
             "base": probability_stats(reviewed, "base_model_probabilities"),
             "context": probability_stats(reviewed, "context_adjusted_probabilities"),
+            "weather": probability_stats(reviewed, "weather_adjusted_probabilities"),
             "tactical": probability_stats(reviewed, "tactical_adjusted_probabilities"),
             "value": probability_stats(reviewed, "value_adjusted_probabilities"),
             "model": probability_stats(reviewed, "model_probabilities"),
@@ -878,6 +1384,10 @@ def main() -> int:
         "matches": reviewed,
         "review_file": out_path.name,
     }
+    summary["mistake_tag_metrics"] = mistake_tag_summary(reviewed)
+    summary["adjustment_module_metrics"] = adjustment_module_metrics(reviewed)
+    summary["odds_movement_metrics"] = odds_movement_summary(reviewed)
+    summary["odds_outcome_cross_metrics"] = odds_outcome_cross_metrics(reviewed)
     summary["advice"] = build_advice(summary, reviewed)
 
     REVIEW_DOCS_DIR.mkdir(parents=True, exist_ok=True)

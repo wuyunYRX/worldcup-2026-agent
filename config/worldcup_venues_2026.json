@@ -1,0 +1,4 @@
+{
+  "_comment": "按 match_time + home_team + away_team 精确匹配比赛场地。请逐步补充 2026 世界杯赛程的球场、城市、经纬度与时区信息。",
+  "matches": []
+}

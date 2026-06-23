@@ -13,6 +13,7 @@ import html
 import json
 import math
 import os
+import random
 import re
 import shutil
 import sys
@@ -63,8 +64,16 @@ DEFAULT_RISK_CONFIG = {
     "enable_ai_probability_adjustment": 1.0,
     "ai_probability_max_delta": 0.03,
     "ai_probability_high_confidence_delta": 0.05,
+    "weather_adjustment_weight": 1.0,
+    "weather_adjustment_max_delta": 0.02,
     "value_adjustment_weight": 1.0,
     "value_adjustment_max_delta": 0.025,
+    "enable_monte_carlo": 1.0,
+    "monte_carlo_simulations": 10000,
+    "monte_carlo_seed": 202606,
+    "monte_carlo_lambda_sigma": 0.10,
+    "score_candidate_top_n": 5,
+    "score_report_top_n": 3,
 }
 TEAM_TRANSLATIONS = {
     "Mexico": "墨西哥",
@@ -469,8 +478,16 @@ def load_risk_config(path: Path, env: Optional[Dict[str, str]] = None) -> Dict[s
             ("ENABLE_AI_PROBABILITY_ADJUSTMENT", "enable_ai_probability_adjustment"),
             ("AI_PROBABILITY_MAX_DELTA", "ai_probability_max_delta"),
             ("AI_PROBABILITY_HIGH_CONFIDENCE_DELTA", "ai_probability_high_confidence_delta"),
+            ("WEATHER_ADJUSTMENT_WEIGHT", "weather_adjustment_weight"),
+            ("WEATHER_ADJUSTMENT_MAX_DELTA", "weather_adjustment_max_delta"),
             ("VALUE_ADJUSTMENT_WEIGHT", "value_adjustment_weight"),
             ("VALUE_ADJUSTMENT_MAX_DELTA", "value_adjustment_max_delta"),
+            ("ENABLE_MONTE_CARLO", "enable_monte_carlo"),
+            ("MONTE_CARLO_SIMULATIONS", "monte_carlo_simulations"),
+            ("MONTE_CARLO_SEED", "monte_carlo_seed"),
+            ("MONTE_CARLO_LAMBDA_SIGMA", "monte_carlo_lambda_sigma"),
+            ("SCORE_CANDIDATE_TOP_N", "score_candidate_top_n"),
+            ("SCORE_REPORT_TOP_N", "score_report_top_n"),
         ):
             if env.get(key):
                 try:
@@ -478,6 +495,25 @@ def load_risk_config(path: Path, env: Optional[Dict[str, str]] = None) -> Dict[s
                 except ValueError:
                     pass
     return config
+
+
+def load_calibration_snapshot(path: Path) -> Dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    calibration = raw.get("calibration")
+    return calibration if isinstance(calibration, dict) else {}
+
+
+def calibration_metric_text(value: object, digits: int = 4, pct_mode: bool = False) -> str:
+    if not isinstance(value, (int, float)):
+        return "暂无"
+    return f"{float(value):.{digits}%}" if pct_mode else f"{float(value):.{digits}f}"
 
 
 def team_display_name(name: str) -> str:
@@ -869,6 +905,179 @@ def total_goals_value_metrics(
     return probabilities, market_probabilities, ev, kelly_fractions
 
 
+def weighted_score_sample(grid: List[Tuple[int, int, float]], rng: random.Random) -> Tuple[int, int]:
+    point = rng.random()
+    cumulative = 0.0
+    for home_goals, away_goals, prob in grid:
+        cumulative += prob
+        if point <= cumulative:
+            return home_goals, away_goals
+    return grid[-1][0], grid[-1][1]
+
+
+def score_entropy(grid: List[Tuple[int, int, float]]) -> float:
+    return -sum(prob * math.log(prob) for _home, _away, prob in grid if prob > 0)
+
+
+def confidence_label(value: float, high: float, medium: float) -> str:
+    if value >= high:
+        return "high"
+    if value >= medium:
+        return "medium"
+    return "low"
+
+
+def monte_carlo_validate_score_prediction(
+    prediction: Optional[dict],
+    risk_config: Dict[str, float],
+    target_probabilities: Optional[Tuple[float, float, float]] = None,
+    market_probabilities: Optional[Tuple[float, float, float]] = None,
+    handicap_line: Optional[float] = None,
+    handicap_market_probabilities: Optional[Tuple[float, float, float]] = None,
+    asian_handicap_line: Optional[float] = None,
+    asian_market_probabilities: Optional[Tuple[float, float]] = None,
+    total_goals_line: Optional[float] = None,
+    total_goals_market_probabilities: Optional[Tuple[float, float]] = None,
+) -> Optional[dict]:
+    if not prediction or not isinstance(prediction, dict):
+        return None
+    grid = prediction.get("score_grid") or []
+    if not grid:
+        return None
+
+    candidate_n = int(risk_config.get("score_candidate_top_n", 5) or 5)
+    report_n = int(risk_config.get("score_report_top_n", 3) or 3)
+    simulations = int(risk_config.get("monte_carlo_simulations", 10000) or 10000)
+    if simulations <= 0:
+        return None
+    seed = int(risk_config.get("monte_carlo_seed", 202606) or 202606)
+    sigma = max(float(risk_config.get("monte_carlo_lambda_sigma", 0.10) or 0.10), 0.0)
+    lambda_home = max(float(prediction.get("lambda_home", 0.0) or 0.0), 0.05)
+    lambda_away = max(float(prediction.get("lambda_away", 0.0) or 0.0), 0.05)
+
+    original_grid = [(int(home), int(away), float(prob)) for home, away, prob in grid]
+    original_grid = sorted(original_grid, key=lambda item: item[2], reverse=True)
+    candidate_top_scores = original_grid[:candidate_n]
+    candidate_keys = {(home, away) for home, away, _prob in candidate_top_scores}
+    candidate_probs = {(home, away): prob for home, away, prob in candidate_top_scores}
+    rng = random.Random(seed + int(lambda_home * 1000) * 31 + int(lambda_away * 1000) * 17)
+
+    score_counts: Dict[Tuple[int, int], int] = {}
+    wdl_counts = [0, 0, 0]
+    total_goals_sum = 0.0
+    goal_diff_sum = 0.0
+    over_25_count = 0
+    over_35_count = 0
+    both_score_count = 0
+
+    market_home, market_draw, market_away = market_probabilities or (0.0, 0.0, 0.0)
+    for _ in range(simulations):
+        home_multiplier = max(0.65, min(1.35, 1.0 + rng.gauss(0.0, sigma)))
+        away_multiplier = max(0.65, min(1.35, 1.0 + rng.gauss(0.0, sigma)))
+        perturbed_home = max(lambda_home * home_multiplier, 0.05)
+        perturbed_away = max(lambda_away * away_multiplier, 0.05)
+        sim_grid = score_grid(perturbed_home, perturbed_away, max_goals=7)
+        sim_grid = rerank_score_grid(
+            sim_grid,
+            perturbed_home,
+            perturbed_away,
+            market_home,
+            market_draw,
+            market_away,
+            target_probabilities,
+            handicap_line,
+            handicap_market_probabilities,
+            asian_handicap_line,
+            asian_market_probabilities,
+            total_goals_line,
+            total_goals_market_probabilities,
+        )
+        sampled_home, sampled_away = weighted_score_sample(sim_grid, rng)
+        key = (sampled_home, sampled_away)
+        score_counts[key] = score_counts.get(key, 0) + 1
+        if sampled_home > sampled_away:
+            wdl_counts[0] += 1
+        elif sampled_home == sampled_away:
+            wdl_counts[1] += 1
+        else:
+            wdl_counts[2] += 1
+        total = sampled_home + sampled_away
+        total_goals_sum += total
+        goal_diff_sum += sampled_home - sampled_away
+        if total >= 3:
+            over_25_count += 1
+        if total >= 4:
+            over_35_count += 1
+        if sampled_home > 0 and sampled_away > 0:
+            both_score_count += 1
+
+    candidate_stability = {
+        f"{home}-{away}": score_counts.get((home, away), 0) / simulations
+        for home, away in candidate_keys
+    }
+    max_candidate_prob = max(candidate_probs.values()) if candidate_probs else 1.0
+    max_stability = max(candidate_stability.values()) if candidate_stability else 1.0
+
+    ranked_candidates: List[Tuple[int, int, float, float]] = []
+    total_error_bias = float(risk_config.get("underestimated_total_goals_rate", 0.0) or 0.0)
+    draw_bias = float(risk_config.get("underestimated_draw_rate", 0.0) or 0.0)
+    narrow_bias = float(risk_config.get("score_distribution_too_narrow_rate", 0.0) or 0.0)
+    for home, away, prob in candidate_top_scores:
+        stability = candidate_stability.get(f"{home}-{away}", 0.0)
+        posterior_component = prob / max_candidate_prob if max_candidate_prob > 0 else 0.0
+        stability_component = stability / max_stability if max_stability > 0 else 0.0
+        market_component = 0.0
+        if target_probabilities:
+            if home > away:
+                market_component = target_probabilities[0]
+            elif home == away:
+                market_component = target_probabilities[1]
+            else:
+                market_component = target_probabilities[2]
+        correction = 0.0
+        if home + away >= 3 and total_error_bias >= 0.30:
+            correction += 0.04
+        if home == away and draw_bias >= 0.25:
+            correction += 0.04
+        if home + away >= 4 and narrow_bias >= 0.30:
+            correction += 0.03
+        final_score = 0.60 * posterior_component + 0.25 * stability_component + 0.10 * market_component + correction
+        display_prob = max(0.0, 0.60 * prob + 0.40 * stability)
+        ranked_candidates.append((home, away, display_prob, final_score))
+
+    ranked_candidates.sort(key=lambda item: item[3], reverse=True)
+    validated_top_scores = [(home, away, prob) for home, away, prob, _score in ranked_candidates[:report_n]]
+    return {
+        "simulations": simulations,
+        "candidate_top_scores": candidate_top_scores,
+        "validated_top_scores": validated_top_scores,
+        "wdl_probabilities": [count / simulations for count in wdl_counts],
+        "expected_total_goals": total_goals_sum / simulations,
+        "expected_goal_diff": goal_diff_sum / simulations,
+        "over_25_probability": over_25_count / simulations,
+        "over_35_probability": over_35_count / simulations,
+        "both_score_probability": both_score_count / simulations,
+        "score_entropy": score_entropy(original_grid),
+        "result_confidence": confidence_label(max(wdl_counts) / simulations, 0.62, 0.50),
+        "score_confidence": confidence_label(max(candidate_stability.values()) if candidate_stability else 0.0, 0.16, 0.10),
+        "candidate_stability": candidate_stability,
+    }
+
+
+def apply_monte_carlo_validation(
+    prediction: Optional[dict],
+    monte_carlo: Optional[dict],
+) -> Optional[dict]:
+    if not prediction or not monte_carlo:
+        return prediction
+    prediction["candidate_top_scores"] = monte_carlo.get("candidate_top_scores")
+    prediction["validated_top_scores"] = monte_carlo.get("validated_top_scores")
+    if monte_carlo.get("validated_top_scores"):
+        prediction["top_scores"] = monte_carlo["validated_top_scores"]
+    prediction["monte_carlo"] = {key: value for key, value in monte_carlo.items() if key not in {"candidate_top_scores", "validated_top_scores"}}
+    return prediction
+
+
 def rerank_score_grid(
     grid: List[Tuple[int, int, float]],
     lambda_home: float,
@@ -1198,6 +1407,34 @@ def prematch_adjustments(prematch: Optional[Dict[str, object]]) -> Tuple[float, 
     if f("away_absence_value_loss_eur_m") >= 15.0:
         away_mul *= 0.96
 
+    temperature_c = f("temperature_c")
+    humidity_pct = f("humidity_pct")
+    wind_kph = f("wind_kph")
+    precipitation_mm = f("precipitation_mm")
+    weather_severity = max(
+        f("weather_severity"),
+        1.0 if temperature_c >= 35.0 or wind_kph >= 35.0 or precipitation_mm >= 8.0 else 0.0,
+        0.7 if temperature_c >= 30.0 or humidity_pct >= 75.0 or wind_kph >= 25.0 or precipitation_mm >= 2.0 else 0.0,
+    )
+    weather_mul = 1.0
+    if temperature_c >= 35.0:
+        weather_mul *= 0.94
+    elif temperature_c >= 30.0:
+        weather_mul *= 0.97
+    if humidity_pct >= 75.0:
+        weather_mul *= 0.98
+    if wind_kph >= 35.0:
+        weather_mul *= 0.94
+    elif wind_kph >= 25.0:
+        weather_mul *= 0.97
+    if precipitation_mm >= 8.0:
+        weather_mul *= 0.94
+    elif precipitation_mm >= 2.0:
+        weather_mul *= 0.97
+    if weather_severity > 0:
+        home_mul *= max(weather_mul, 0.85)
+        away_mul *= max(weather_mul, 0.85)
+
     metadata = {
         "home_injury_count": f("home_injury_count"),
         "away_injury_count": f("away_injury_count"),
@@ -1237,6 +1474,13 @@ def prematch_adjustments(prematch: Optional[Dict[str, object]]) -> Tuple[float, 
         "away_coach_style_counter": f("away_coach_style_counter"),
         "tactical_summary": prematch.get("tactical_summary", "") if prematch else "",
         "tactical_source": prematch.get("tactical_source", "") if prematch else "",
+        "temperature_c": temperature_c,
+        "humidity_pct": humidity_pct,
+        "wind_kph": wind_kph,
+        "precipitation_mm": precipitation_mm,
+        "weather_severity": weather_severity,
+        "weather_summary": prematch.get("weather_summary", "") if prematch else "",
+        "weather_source": prematch.get("weather_source", "") if prematch else "",
     }
     return home_mul, away_mul, metadata
 
@@ -1343,6 +1587,11 @@ def score_prediction_from_trained_model(
         "away_market_prob": market_away,
         "neutral_flag": neutral_flag,
         "knockout_flag": knockout_flag,
+        "temperature_c": 0.0,
+        "humidity_pct": 0.0,
+        "wind_kph": 0.0,
+        "precipitation_mm": 0.0,
+        "weather_severity": 0.0,
     }
     prematch = None
     if prematch_news_index is not None:
@@ -1382,6 +1631,11 @@ def score_prediction_from_trained_model(
             feature_map["away_absence_value_loss_eur_m"] = prematch_float(prematch, "away_absence_value_loss_eur_m")
             feature_map["player_value_mismatch_home"] = prematch_float(prematch, "player_value_mismatch_home")
             feature_map["player_value_mismatch_away"] = prematch_float(prematch, "player_value_mismatch_away")
+            feature_map["temperature_c"] = prematch_float(prematch, "temperature_c")
+            feature_map["humidity_pct"] = prematch_float(prematch, "humidity_pct")
+            feature_map["wind_kph"] = prematch_float(prematch, "wind_kph")
+            feature_map["precipitation_mm"] = prematch_float(prematch, "precipitation_mm")
+            feature_map["weather_severity"] = prematch_float(prematch, "weather_severity")
     features = [float(feature_map.get(name, 0.0)) for name in feature_names]
     lambda_home = clamp_exp(dot(features, home_weights))
     lambda_away = clamp_exp(dot(features, away_weights))
@@ -1630,6 +1884,21 @@ def parse_odds_page(
             if probs
             else None
         )
+        monte_carlo = None
+        if risk_config.get("enable_monte_carlo", 1.0) > 0:
+            monte_carlo = monte_carlo_validate_score_prediction(
+                score_prediction,
+                risk_config,
+                target_probabilities=probs,
+                market_probabilities=market_probs,
+                handicap_line=handicap_line,
+                handicap_market_probabilities=handicap_market_for_score,
+                asian_handicap_line=asian_handicap_line,
+                asian_market_probabilities=asian_market_for_score,
+                total_goals_line=total_goals_line,
+                total_goals_market_probabilities=total_goals_market_for_score,
+            )
+            score_prediction = apply_monte_carlo_validation(score_prediction, monte_carlo)
         handicap_probs = handicap_probabilities_from_score_prediction(score_prediction, handicap_line, probs)
         handicap_market_probs, handicap_fused_probs, handicap_ev, handicap_kelly_fractions, handicap_kelly_stakes = apply_value_metrics(handicap_probs, handicap_odds, risk_config)
         score_grid_rows = (score_prediction or {}).get("score_grid") if isinstance(score_prediction, dict) else None
@@ -1660,6 +1929,7 @@ def parse_odds_page(
                 "probabilities": probs,
                 "ai_adjusted_probabilities": probs,
                 "context_adjusted_probabilities": (ai_adjustment.get("context_adjusted_probabilities") or probs),
+                "weather_adjusted_probabilities": (ai_adjustment.get("weather_adjusted_probabilities") or ai_adjustment.get("context_adjusted_probabilities") or probs),
                 "tactical_adjusted_probabilities": ai_adjustment.get("tactical_adjusted_probabilities"),
                 "value_adjusted_probabilities": ai_adjustment.get("value_adjusted_probabilities"),
                 "ai_adjustment": ai_adjustment,
@@ -1691,6 +1961,7 @@ def parse_odds_page(
                 "kelly_fractions": kelly_fractions,
                 "kelly_stakes": kelly_stakes,
                 "score_prediction": score_prediction,
+                "monte_carlo": monte_carlo,
             }
         )
     return sorted(rows, key=lambda r: (r["match_time"], r["num"]))
@@ -1763,6 +2034,10 @@ def fetch_qtx_future_matches(
                     prematch_news_index=prematch_news_index,
                 )
                 score_prediction = trained_prediction or (score_prediction_from_wdl(probs) if probs else None)
+                monte_carlo = None
+                if risk_config.get("enable_monte_carlo", 1.0) > 0:
+                    monte_carlo = monte_carlo_validate_score_prediction(score_prediction, risk_config, target_probabilities=probs, market_probabilities=market_probs)
+                    score_prediction = apply_monte_carlo_validation(score_prediction, monte_carlo)
                 handicap_probs = handicap_probabilities_from_score_prediction(score_prediction, 0.0, probs)
                 handicap_market_probs, handicap_fused_probs, handicap_ev, handicap_kelly_fractions, handicap_kelly_stakes = apply_value_metrics(handicap_probs, handicap_odds, risk_config)
                 score_grid_rows = (score_prediction or {}).get("score_grid") if isinstance(score_prediction, dict) else None
@@ -1792,6 +2067,7 @@ def fetch_qtx_future_matches(
                         "probabilities": probs,
                         "ai_adjusted_probabilities": probs,
                         "context_adjusted_probabilities": (ai_adjustment.get("context_adjusted_probabilities") or probs),
+                        "weather_adjusted_probabilities": (ai_adjustment.get("weather_adjusted_probabilities") or ai_adjustment.get("context_adjusted_probabilities") or probs),
                         "tactical_adjusted_probabilities": ai_adjustment.get("tactical_adjusted_probabilities"),
                         "value_adjusted_probabilities": ai_adjustment.get("value_adjusted_probabilities"),
                         "ai_adjustment": ai_adjustment,
@@ -1822,6 +2098,7 @@ def fetch_qtx_future_matches(
                         "kelly_fractions": kelly_fractions,
                         "kelly_stakes": kelly_stakes,
                         "score_prediction": score_prediction,
+                        "monte_carlo": monte_carlo,
                     }
                 )
             except Exception:
@@ -1974,6 +2251,15 @@ def odds_text(odds: Iterable[float]) -> str:
     if not values or all(v <= 0 for v in values):
         return "普通胜平负未开"
     return " / ".join(f"{v:.2f}" for v in values)
+
+
+def safe_odds_triplet(value: object) -> List[float]:
+    if not isinstance(value, list):
+        return [0.0, 0.0, 0.0]
+    padded = [float(item or 0.0) for item in value[:3]]
+    while len(padded) < 3:
+        padded.append(0.0)
+    return padded
 
 
 def ev_text(value: Optional[float]) -> str:
@@ -2135,10 +2421,13 @@ def result_reason_text(row: dict) -> str:
     idx, probability, margin = predicted_outcome(row)
     market = row.get("market_probabilities") or (0.0, 0.0, 0.0)
     model = row.get("probabilities") or (0.0, 0.0, 0.0)
-    tactical = ((row.get("score_prediction") or {}).get("prematch_adjustments") or {}).get("tactical_summary", "")
+    prematch_meta = (row.get("score_prediction") or {}).get("prematch_adjustments") or {}
+    tactical = prematch_meta.get("tactical_summary", "")
+    weather = prematch_meta.get("weather_summary", "")
     market_hint = "赔率未开，主要看模型" if not any(market) else f"市场去水 {pct(market[idx], 1)}，模型 {pct(model[idx], 1)}"
     tactical_hint = f"；战术：{tactical}" if tactical else ""
-    return f"领先第二方向 {pct(margin, 1)}；{market_hint}{tactical_hint}"
+    weather_hint = f"；天气：{weather}" if weather else ""
+    return f"领先第二方向 {pct(margin, 1)}；{market_hint}{tactical_hint}{weather_hint}"
 
 
 def ai_adjustment_summary(row: dict) -> str:
@@ -2151,13 +2440,17 @@ def ai_adjustment_summary(row: dict) -> str:
     delta = adjustment.get("delta") or [0.0, 0.0, 0.0]
     reasons = adjustment.get("reasons") or []
     value_reasons = adjustment.get("value_reasons") or []
+    weather_reasons = adjustment.get("weather_reasons") or []
     confidence = str(adjustment.get("confidence", "low"))
-    tactical = ((row.get("score_prediction") or {}).get("prematch_adjustments") or {}).get("tactical_summary", "")
+    prematch_meta = (row.get("score_prediction") or {}).get("prematch_adjustments") or {}
+    tactical = prematch_meta.get("tactical_summary", "")
+    weather = prematch_meta.get("weather_summary", "")
     delta_text = " / ".join(f"{OUTCOME_NAMES[idx]} {delta[idx] * 100:+.1f}%" for idx in range(min(3, len(delta))))
-    reason_parts = [str(item) for item in reasons[:2]] + [str(item) for item in value_reasons[:1]]
+    reason_parts = [str(item) for item in reasons[:2]] + [str(item) for item in weather_reasons[:1]] + [str(item) for item in value_reasons[:1]]
     reason_text = "、".join(reason_parts) if reason_parts else "赛前情报修正"
     tactical_text = f"；{tactical}" if tactical else ""
-    return f"{delta_text}；置信度 {confidence}；{reason_text}{tactical_text}"
+    weather_text = f"；天气：{weather}" if weather else ""
+    return f"{delta_text}；置信度 {confidence}；{reason_text}{tactical_text}{weather_text}"
 
 
 def ticket_metrics(picks: List[Tuple[dict, int]], stake_per_pick: float = 2.0) -> Tuple[float, float, float, float]:
@@ -2248,6 +2541,7 @@ def row_html(row: dict) -> str:
     kelly_fractions = row.get("kelly_fractions") or [0.0, 0.0, 0.0]
     ev_cells = " / ".join(f'<span class="{ev_class(x)}">{ev_text(x)}</span>' for x in evs)
     kelly_cells = " / ".join(f"{value * 100:.1f}%" for value in kelly_fractions)
+    odds_change = ((row.get("normal_odds_change") or {}).get("summary") or "暂无赔率变化")
     return (
         "<tr>"
         f"<td>{html.escape(row['num'])}</td>"
@@ -2255,6 +2549,7 @@ def row_html(row: dict) -> str:
         f"<td>{html.escape(row['home'])} vs {html.escape(row['away'])}</td>"
         f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
         f"<td>{html.escape(odds_text(row['normal_odds']))}</td>"
+        f"<td>{html.escape(odds_change)}</td>"
         f"<td>{html.escape(odds_text(row['handicap_odds']))}</td>"
         f"<td>{ev_cells}</td>"
         f"<td>{html.escape(kelly_cells)}</td>"
@@ -2271,6 +2566,7 @@ def generate_report(
     fifa_scores_url: str = DEFAULT_FIFA_SCORES_URL,
 ) -> str:
     risk_config = risk_config or dict(DEFAULT_RISK_CONFIG)
+    calibration_snapshot = load_calibration_snapshot(ROOT / "config" / "bayesian_calibration.json")
     candidates = select_candidates(rows)
     picks = select_ticket(rows, risk_config)
     stake, expected_return, roi, profit_probability, stake_details = ticket_metrics_with_stakes(picks)
@@ -2285,6 +2581,7 @@ def generate_report(
         f"<td>{html.escape(result_pick_text(row))}</td>"
         f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
         f"<td>{html.escape(goal_trend_text(row['score_prediction']))}</td>"
+        f"<td>{html.escape(((row.get('normal_odds_change') or {}).get('summary') or '暂无赔率变化'))}</td>"
         "</tr>"
         for row in focus
     )
@@ -2297,6 +2594,7 @@ def generate_report(
         f"<td>{html.escape(result_pick_text(row))}</td>"
         f"<td>{html.escape(score_prediction_text(row['score_prediction']))}</td>"
         f"<td>{html.escape(goal_trend_text(row['score_prediction']))}</td>"
+        f"<td>{html.escape(((row.get('normal_odds_change') or {}).get('summary') or '暂无赔率变化'))}</td>"
         "</tr>"
         for row in display_rows
     )
@@ -2355,6 +2653,23 @@ def generate_report(
     ]
     no_normal_text = "、".join(no_normal) if no_normal else "无"
     kelly_label = kelly_fraction_text(risk_config.get("kelly_fraction", 0.25))
+    module_rows: List[str] = []
+    module_specs = [
+        ("weather", "天气修正", "weather_model_accuracy", "weather_model_brier", "weather_model_logloss", "weather_adjustment_decision"),
+        ("tactical", "战术修正", "tactical_model_accuracy", "tactical_model_brier", "tactical_model_logloss", "tactical_adjustment_decision"),
+        ("value", "身价/阵容价值修正", "value_model_accuracy", "value_model_brier", "value_model_logloss", "value_adjustment_decision"),
+    ]
+    for _module_name, label, acc_key, brier_key, logloss_key, decision_key in module_specs:
+        module_rows.append(
+            "<tr>"
+            f"<td>{label}</td>"
+            f"<td>{calibration_metric_text(calibration_snapshot.get(acc_key), digits=1, pct_mode=True)}</td>"
+            f"<td>{calibration_metric_text(calibration_snapshot.get(brier_key), digits=4)}</td>"
+            f"<td>{calibration_metric_text(calibration_snapshot.get(logloss_key), digits=4)}</td>"
+            f"<td>{html.escape(str(calibration_snapshot.get(decision_key, '暂无')))}</td>"
+            "</tr>"
+        )
+    module_review_rows = "\n".join(module_rows) or '<tr><td colspan="5">暂无最近一次复盘模块效果。</td></tr>'
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -2389,23 +2704,31 @@ th {{ background: #eef3f8; text-align: left; }}
 <p>当前抓取到可售世界杯场次 {len(rows)} 场，其中模型已覆盖 {len(modeled_rows)} 场。普通胜平负未开场次：{html.escape(no_normal_text)}。</p>
 </section>
 
+<section id="module-review">
+<h2>最近一次复盘模块效果</h2>
+<p class="muted">数据来自 `config/bayesian_calibration.json` 中最近一次复盘校准结果，用于观察天气、战术、身价修正的独立表现。</p>
+<table><thead><tr><th>模块</th><th>准确率</th><th>Brier</th><th>logloss</th><th>调优结论</th></tr></thead><tbody>
+{module_review_rows}
+</tbody></table>
+</section>
+
 <section id="matches-24h">
 <h2>今日/未来 24 小时重点预测</h2>
-<table><thead><tr><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>最可能比分</th><th>进球倾向</th></tr></thead><tbody>
+<table><thead><tr><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>最可能比分</th><th>进球倾向</th><th>赔率变化</th></tr></thead><tbody>
 {focus_rows}
 </tbody></table>
 </section>
 
 <section id="result-predictions">
 <h2>赛果预测总览</h2>
-<table><thead><tr><th>编号</th><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>比分 Top3</th><th>进球倾向</th></tr></thead><tbody>
+<table><thead><tr><th>编号</th><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>比分 Top3</th><th>进球倾向</th><th>赔率变化</th></tr></thead><tbody>
 {result_rows}
 </tbody></table>
 </section>
 
 <section id="remaining-probabilities">
 <h2>赔率与概率明细</h2>
-<table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>最可能比分</th><th>当前不让球赔率（主胜/平/客胜）</th><th>让球赔率（胜/平/负）</th><th>EV（主胜/平/客胜）</th><th>Kelly%</th><th>备注</th></tr></thead><tbody>
+<table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>最可能比分</th><th>当前不让球赔率（主胜/平/客胜）</th><th>赔率变化</th><th>让球赔率（胜/平/负）</th><th>EV（主胜/平/客胜）</th><th>Kelly%</th><th>备注</th></tr></thead><tbody>
 {''.join(row_html(row) for row in display_rows)}
 </tbody></table>
 </section>
@@ -2572,6 +2895,93 @@ def timestamped_path(path: Path, generated_at: dt.datetime) -> Path:
     return path.with_name(f"{path.stem}_{stamp}{path.suffix}")
 
 
+def prediction_snapshot_files() -> List[Path]:
+    return sorted((ROOT / "docs" / "run").glob("worldcup-2026-agent-predictions_*.json"))
+
+
+def build_odds_history_index(before: Optional[dt.datetime] = None) -> Dict[Tuple[str, str, str], List[Dict[str, object]]]:
+    history: Dict[Tuple[str, str, str], List[Dict[str, object]]] = {}
+    for path in prediction_snapshot_files():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        generated_at_text = str(payload.get("generated_at", ""))
+        try:
+            generated_at = dt.datetime.fromisoformat(generated_at_text)
+        except ValueError:
+            continue
+        if before and generated_at >= before:
+            continue
+        matches = payload.get("matches")
+        if not isinstance(matches, list):
+            continue
+        for row in matches:
+            if not isinstance(row, dict):
+                continue
+            key = (
+                normalize_text(str(row.get("match_time", ""))),
+                normalize_text(str(row.get("home", ""))),
+                normalize_text(str(row.get("away", ""))),
+            )
+            if not all(key):
+                continue
+            normal_odds = safe_odds_triplet(row.get("normal_odds"))
+            history.setdefault(key, []).append(
+                {
+                    "generated_at": generated_at_text,
+                    "normal_odds": normal_odds,
+                    "snapshot": path.name,
+                }
+            )
+    for entries in history.values():
+        entries.sort(key=lambda item: str(item.get("generated_at", "")))
+    return history
+
+
+def odds_change_summary(opening: List[float], current: List[float]) -> str:
+    labels = ["主胜", "平", "客胜"]
+    parts: List[str] = []
+    for idx, label in enumerate(labels):
+        if idx >= len(opening) or idx >= len(current):
+            continue
+        start = float(opening[idx] or 0.0)
+        now = float(current[idx] or 0.0)
+        if start <= 0 or now <= 0:
+            continue
+        delta = now - start
+        if abs(delta) < 1e-9:
+            direction = "持平"
+        elif delta < 0:
+            direction = f"下降 {abs(delta):.2f}"
+        else:
+            direction = f"上升 {delta:.2f}"
+        parts.append(f"{label}{direction}")
+    return "；".join(parts) if parts else "暂无赔率变化"
+
+
+def attach_odds_history(rows: List[dict], generated_at: dt.datetime) -> None:
+    history_index = build_odds_history_index(before=generated_at)
+    for row in rows:
+        key = (
+            normalize_text(str(row.get("match_time", ""))),
+            normalize_text(str(row.get("home", ""))),
+            normalize_text(str(row.get("away", ""))),
+        )
+        entries = history_index.get(key, [])
+        current = safe_odds_triplet(row.get("normal_odds"))
+        row["odds_timeline"] = entries[-8:]
+        row["opening_normal_odds"] = safe_odds_triplet(entries[0].get("normal_odds")) if entries else list(current)
+        row["previous_normal_odds"] = safe_odds_triplet(entries[-1].get("normal_odds")) if entries else list(current)
+        opening = row["opening_normal_odds"]
+        previous = row["previous_normal_odds"]
+        row["normal_odds_change"] = {
+            "from_opening": [float(current[idx] or 0.0) - float(opening[idx] or 0.0) for idx in range(3)],
+            "from_previous": [float(current[idx] or 0.0) - float(previous[idx] or 0.0) for idx in range(3)],
+            "summary": odds_change_summary(opening, list(current)),
+        }
+
+
 def serialize_rows(rows: List[dict], generated_at: dt.datetime, odds_url: str) -> Dict[str, object]:
     payload_rows: List[Dict[str, object]] = []
     for row in rows:
@@ -2588,12 +2998,17 @@ def serialize_rows(rows: List[dict], generated_at: dt.datetime, odds_url: str) -
                 "probabilities": row.get("probabilities"),
                 "ai_adjusted_probabilities": row.get("ai_adjusted_probabilities"),
                 "context_adjusted_probabilities": row.get("context_adjusted_probabilities"),
+                "weather_adjusted_probabilities": row.get("weather_adjusted_probabilities"),
                 "tactical_adjusted_probabilities": row.get("tactical_adjusted_probabilities"),
                 "value_adjusted_probabilities": row.get("value_adjusted_probabilities"),
                 "ai_adjustment": row.get("ai_adjustment"),
                 "market_probabilities": row.get("market_probabilities"),
                 "fused_probabilities": row.get("fused_probabilities"),
                 "normal_odds": row.get("normal_odds"),
+                "opening_normal_odds": row.get("opening_normal_odds"),
+                "previous_normal_odds": row.get("previous_normal_odds"),
+                "normal_odds_change": row.get("normal_odds_change"),
+                "odds_timeline": row.get("odds_timeline"),
                 "handicap": row.get("handicap"),
                 "handicap_odds": row.get("handicap_odds"),
                 "asian_handicap_line": row.get("asian_handicap_line"),
@@ -2623,10 +3038,13 @@ def serialize_rows(rows: List[dict], generated_at: dt.datetime, odds_url: str) -
                     "lambda_home": prediction.get("lambda_home"),
                     "lambda_away": prediction.get("lambda_away"),
                     "top_scores": prediction.get("top_scores"),
+                    "candidate_top_scores": prediction.get("candidate_top_scores"),
+                    "validated_top_scores": prediction.get("validated_top_scores"),
                     "score_grid": prediction.get("score_grid"),
                     "over_25": prediction.get("over_25"),
                     "both_score": prediction.get("both_score"),
                     "prematch_adjustments": prediction.get("prematch_adjustments"),
+                    "monte_carlo": prediction.get("monte_carlo") or row.get("monte_carlo"),
                     "source": prediction.get("source"),
                 }
                 if prediction
@@ -2661,10 +3079,15 @@ def serialize_training_candidates(rows: List[dict], generated_at: dt.datetime) -
                 "probabilities": row.get("probabilities"),
                 "ai_adjusted_probabilities": row.get("ai_adjusted_probabilities"),
                 "context_adjusted_probabilities": row.get("context_adjusted_probabilities"),
+                "weather_adjusted_probabilities": row.get("weather_adjusted_probabilities"),
                 "tactical_adjusted_probabilities": row.get("tactical_adjusted_probabilities"),
                 "value_adjusted_probabilities": row.get("value_adjusted_probabilities"),
                 "ai_adjustment": row.get("ai_adjustment"),
                 "normal_odds": row.get("normal_odds"),
+                "opening_normal_odds": row.get("opening_normal_odds"),
+                "previous_normal_odds": row.get("previous_normal_odds"),
+                "normal_odds_change": row.get("normal_odds_change"),
+                "odds_timeline": row.get("odds_timeline"),
                 "handicap": row.get("handicap"),
                 "handicap_odds": row.get("handicap_odds"),
                 "asian_handicap_line": row.get("asian_handicap_line"),
@@ -2697,9 +3120,19 @@ def serialize_training_candidates(rows: List[dict], generated_at: dt.datetime) -
                 "away_rotation_flag": prematch.get("away_rotation_flag", 0),
                 "must_win_flag_home": prematch.get("must_win_flag_home", 0),
                 "must_win_flag_away": prematch.get("must_win_flag_away", 0),
+                "temperature_c": prematch.get("temperature_c", 0),
+                "humidity_pct": prematch.get("humidity_pct", 0),
+                "wind_kph": prematch.get("wind_kph", 0),
+                "precipitation_mm": prematch.get("precipitation_mm", 0),
+                "weather_severity": prematch.get("weather_severity", 0),
+                "weather_summary": prematch.get("weather_summary", ""),
+                "weather_source": prematch.get("weather_source", ""),
                 "lambda_home": prediction.get("lambda_home"),
                 "lambda_away": prediction.get("lambda_away"),
                 "top_scores": prediction.get("top_scores"),
+                "candidate_top_scores": prediction.get("candidate_top_scores"),
+                "validated_top_scores": prediction.get("validated_top_scores"),
+                "monte_carlo": prediction.get("monte_carlo") or row.get("monte_carlo"),
                 "source": "run_snapshot_training_candidate",
             }
         )
@@ -2764,7 +3197,10 @@ def main() -> int:
         enable_zgzcw_asian=enable_zgzcw_asian,
         enable_zgzcw_total_goals=enable_zgzcw_total_goals,
     )
-    qtx_enabled = args.qtx_supplement or env.get("QTX_SUPPLEMENT", "0").lower() in {"1", "true", "yes", "on"}
+    qtx_enabled = args.qtx_supplement or any(
+        env.get(key, "0").lower() in {"1", "true", "yes", "on"}
+        for key in ("QTX_SUPPLEMENT", "ENABLE_QTX_SUPPLEMENT")
+    )
     if qtx_enabled:
         qtx_rows = fetch_qtx_future_matches(model, score_model=score_model, risk_config=risk_config, qtx_url=qtx_world_cup_url)
         rows = merge_candidate_rows(rows, qtx_rows)
@@ -2774,6 +3210,7 @@ def main() -> int:
         apply_external_total_goals_markets(rows, total_goals_markets, risk_config)
     generated_at = dt.datetime.now()
     rows = filter_nearby_rows(rows, generated_at, days=args.days)
+    attach_odds_history(rows, generated_at)
     if not rows:
         print("No World Cup odds rows were parsed.", file=sys.stderr)
     report = generate_report(rows, odds_url, generated_at, risk_config=risk_config, fifa_scores_url=fifa_scores_url)
@@ -2793,7 +3230,11 @@ def main() -> int:
         screenshot_ok = render_report_screenshot(report_path, screenshot_path)
         if screenshot_ok and latest_copy_enabled:
             shutil.copyfile(screenshot_path, screenshot_base_path)
-        send_telegram_screenshot(env, screenshot_path, generated_at)
+        if not screenshot_ok and env.get("ALLOW_MISSING_SCREENSHOT", "0").lower() not in {"1", "true", "yes", "on"}:
+            print("Screenshot failed: use --skip-screenshot to generate HTML/JSON only, or set ALLOW_MISSING_SCREENSHOT=1 to allow missing PNG.", file=sys.stderr)
+            return 2
+        if screenshot_ok:
+            send_telegram_screenshot(env, screenshot_path, generated_at)
     print(f"Report written: {report_path}")
     if latest_copy_enabled:
         print(f"Latest report copy written: {report_base_path}")
