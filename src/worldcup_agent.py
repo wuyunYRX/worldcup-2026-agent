@@ -1165,6 +1165,52 @@ def rerank_score_grid(
     return [(home_goals, away_goals, prob / total) for home_goals, away_goals, prob in adjusted]
 
 
+def calibrate_lambdas_with_score_markets(
+    lambda_home: float,
+    lambda_away: float,
+    asian_handicap_line: Optional[float] = None,
+    asian_market_probabilities: Optional[Tuple[float, float]] = None,
+    total_goals_line: Optional[float] = None,
+    total_goals_market_probabilities: Optional[Tuple[float, float]] = None,
+) -> Tuple[float, float, Dict[str, float]]:
+    total_goals = max(lambda_home + lambda_away, 0.1)
+    goal_diff = lambda_home - lambda_away
+    adjusted_total = total_goals
+    adjusted_diff = goal_diff
+    meta: Dict[str, float] = {
+        "original_total_goals": total_goals,
+        "original_goal_diff": goal_diff,
+    }
+
+    if total_goals_line is not None and total_goals_market_probabilities:
+        over_prob, under_prob = total_goals_market_probabilities
+        if over_prob > 0 and under_prob > 0:
+            total_bias = max(min(over_prob - under_prob, 0.35), -0.35)
+            target_total = max(min(total_goals_line + total_bias * 0.75, 4.2), 1.2)
+            adjusted_total = total_goals * 0.82 + target_total * 0.18
+            meta["target_total_goals_from_market"] = target_total
+
+    if asian_handicap_line is not None and asian_market_probabilities:
+        home_cover_prob, away_cover_prob = asian_market_probabilities
+        if home_cover_prob > 0 and away_cover_prob > 0:
+            cover_bias = max(min(home_cover_prob - away_cover_prob, 0.35), -0.35)
+            target_diff = max(min(-asian_handicap_line + cover_bias * 0.45, 3.0), -3.0)
+            adjusted_diff = goal_diff * 0.84 + target_diff * 0.16
+            meta["target_goal_diff_from_market"] = target_diff
+
+    adjusted_diff = max(min(adjusted_diff, adjusted_total - 0.1), -adjusted_total + 0.1)
+    new_home = max((adjusted_total + adjusted_diff) / 2.0, 0.05)
+    new_away = max((adjusted_total - adjusted_diff) / 2.0, 0.05)
+    new_total = new_home + new_away
+    if new_total > 0 and abs(new_total - adjusted_total) > 1e-9:
+        scale = adjusted_total / new_total
+        new_home = max(new_home * scale, 0.05)
+        new_away = max(new_away * scale, 0.05)
+    meta["adjusted_total_goals"] = new_home + new_away
+    meta["adjusted_goal_diff"] = new_home - new_away
+    return new_home, new_away, meta
+
+
 def score_prediction_from_wdl(
     probabilities: Tuple[float, float, float],
     handicap_line: Optional[float] = None,
@@ -1204,11 +1250,19 @@ def score_prediction_from_wdl(
                 best_error = error
                 best_lambdas = (home_lam, away_lam)
 
-    grid = score_grid(best_lambdas[0], best_lambdas[1], max_goals=7)
-    grid = rerank_score_grid(
-        grid,
+    lambda_home, lambda_away, market_lambda_meta = calibrate_lambdas_with_score_markets(
         best_lambdas[0],
         best_lambdas[1],
+        asian_handicap_line,
+        asian_market_probabilities,
+        total_goals_line,
+        total_goals_market_probabilities,
+    )
+    grid = score_grid(lambda_home, lambda_away, max_goals=7)
+    grid = rerank_score_grid(
+        grid,
+        lambda_home,
+        lambda_away,
         probabilities[0],
         probabilities[1],
         probabilities[2],
@@ -1224,12 +1278,13 @@ def score_prediction_from_wdl(
     over_25 = sum(prob for home_goals, away_goals, prob in grid if home_goals + away_goals >= 3)
     both_score = sum(prob for home_goals, away_goals, prob in grid if home_goals > 0 and away_goals > 0)
     return {
-        "lambda_home": best_lambdas[0],
-        "lambda_away": best_lambdas[1],
+        "lambda_home": lambda_home,
+        "lambda_away": lambda_away,
         "score_grid": grid,
         "top_scores": top_scores,
         "over_25": over_25,
         "both_score": both_score,
+        "market_lambda_adjustments": market_lambda_meta,
     }
 
 
@@ -1642,6 +1697,14 @@ def score_prediction_from_trained_model(
     home_mul, away_mul, prematch_meta = prematch_adjustments(prematch)
     lambda_home *= home_mul
     lambda_away *= away_mul
+    lambda_home, lambda_away, market_lambda_meta = calibrate_lambdas_with_score_markets(
+        lambda_home,
+        lambda_away,
+        asian_handicap_line,
+        asian_market_probabilities,
+        total_goals_line,
+        total_goals_market_probabilities,
+    )
     rho = 0.0
     score_correlation = score_model.get("score_correlation", {}) if isinstance(score_model, dict) else {}
     if isinstance(score_correlation, dict):
@@ -1676,6 +1739,7 @@ def score_prediction_from_trained_model(
         "over_25": over_25,
         "both_score": both_score,
         "prematch_adjustments": prematch_meta,
+        "market_lambda_adjustments": market_lambda_meta,
         "source": "trained_score_model",
     }
 

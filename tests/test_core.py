@@ -24,9 +24,11 @@ from review_completed_matches import (  # noqa: E402
     odds_outcome_cross_metrics,
     outcome_mistake_tags,
     score_diagnosis,
+    score_market_direction_diagnosis,
     score_metric_summary,
     top1_hit,
     top3_hit,
+    top5_hit,
 )
 from fetch_match_weather import build_weather_entry, load_venue_config, lookup_venue_by_city  # noqa: E402
 from fetch_prematch_team_news import load_match_weather_index, merge_weather  # noqa: E402
@@ -38,6 +40,7 @@ from worldcup_agent import (  # noqa: E402
     apply_value_metrics,
     build_group_standings,
     safe_odds_triplet,
+    calibrate_lambdas_with_score_markets,
     build_team_aliases,
     calibrate_wdl_probabilities,
     filter_nearby_rows,
@@ -169,6 +172,7 @@ class CoreMathTests(unittest.TestCase):
         prediction = {"top_scores": [(1, 0, 0.2), (2, 1, 0.1), (0, 0, 0.08)]}
         self.assertTrue(top1_hit(prediction, 1, 0))
         self.assertTrue(top3_hit(prediction, 2, 1))
+        self.assertFalse(top5_hit(prediction, 3, 2))
 
     def test_score_diagnosis_flags_total_goals_and_big_win(self):
         prediction = {
@@ -184,9 +188,51 @@ class CoreMathTests(unittest.TestCase):
         self.assertIn("underestimated_total_goals", diagnosis["score_diagnosis"])
         self.assertIn("underestimated_big_win", diagnosis["score_diagnosis"])
         self.assertIn("score_distribution_too_narrow", diagnosis["score_diagnosis"])
-        summary = score_metric_summary([{**diagnosis, "top3_hit": False}], exact_hits=0, top3_hits=0)
+        summary = score_metric_summary([{**diagnosis, "top3_hit": False, "top5_hit": False}], exact_hits=0, top3_hits=0)
         self.assertEqual(summary["top3_hit_rate"], 0.0)
+        self.assertEqual(summary["top5_hit_rate"], 0.0)
         self.assertGreater(summary["underestimated_total_goals_rate"], 0.0)
+
+    def test_score_market_direction_diagnosis(self):
+        prediction_row = {
+            "total_goals_line": 2.5,
+            "total_goals_probabilities": {
+                "over_full_win": 0.58,
+                "over_half_win": 0.0,
+                "push": 0.0,
+                "over_half_loss": 0.0,
+                "over_full_loss": 0.42,
+            },
+            "asian_handicap_line": -0.5,
+            "asian_handicap_probabilities": {
+                "home_full_win": 0.62,
+                "home_half_win": 0.0,
+                "push": 0.0,
+                "home_half_loss": 0.0,
+                "home_full_loss": 0.38,
+            },
+        }
+        diagnosis = score_market_direction_diagnosis(prediction_row, 2, 1)
+        self.assertEqual(diagnosis["total_goals_model_direction"], "over")
+        self.assertEqual(diagnosis["total_goals_actual_direction"], "over")
+        self.assertTrue(diagnosis["total_goals_direction_hit"])
+        self.assertEqual(diagnosis["asian_handicap_model_direction"], "home_cover")
+        self.assertEqual(diagnosis["asian_handicap_actual_direction"], "home_cover")
+        self.assertTrue(diagnosis["asian_handicap_direction_hit"])
+
+    def test_calibrate_lambdas_with_score_markets(self):
+        home_lam, away_lam, meta = calibrate_lambdas_with_score_markets(
+            1.2,
+            1.0,
+            asian_handicap_line=-1.0,
+            asian_market_probabilities=(0.62, 0.38),
+            total_goals_line=3.0,
+            total_goals_market_probabilities=(0.64, 0.36),
+        )
+        self.assertGreater(home_lam + away_lam, 2.2)
+        self.assertGreater(home_lam - away_lam, 0.2)
+        self.assertIn("target_total_goals_from_market", meta)
+        self.assertIn("target_goal_diff_from_market", meta)
 
 
 class ReportFlowTests(unittest.TestCase):

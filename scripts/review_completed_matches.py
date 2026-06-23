@@ -48,6 +48,7 @@ MISTAKE_TAG_LABELS = {
 }
 
 from worldcup_agent import (  # noqa: E402
+    asian_handicap_return_units,
     calibrate_wdl_probabilities,
     estimate_match_probabilities,
     infer_team_strengths,
@@ -56,6 +57,7 @@ from worldcup_agent import (  # noqa: E402
     market_probabilities_from_odds,
     normalize_text,
     score_prediction_from_wdl,
+    total_goals_return_units,
 )
 from ai_probability_adjustment import adjust_probabilities_with_ai_context  # noqa: E402
 
@@ -322,6 +324,7 @@ def build_full_playback_samples(results: List[Dict[str, object]]) -> List[Dict[s
                 "predicted_top3": score_prediction.get("top_scores") or [],
                 "exact_hit": top1_hit(score_prediction, actual_home, actual_away),
                 "top3_hit": top3_hit(score_prediction, actual_home, actual_away),
+                "top5_hit": top5_hit(score_prediction, actual_home, actual_away),
                 **diagnosis,
                 "sample_source": source,
             }
@@ -478,8 +481,28 @@ def top1_hit(prediction: Dict[str, object], actual_home: int, actual_away: int) 
 
 
 def top3_hit(prediction: Dict[str, object], actual_home: int, actual_away: int) -> bool:
-    top_scores = prediction.get("top_scores") or []
-    for home, away, _prob in top_scores:
+    return top_n_hit(prediction, actual_home, actual_away, 3)
+
+
+def top5_hit(prediction: Dict[str, object], actual_home: int, actual_away: int) -> bool:
+    return top_n_hit(prediction, actual_home, actual_away, 5)
+
+
+def top_n_hit(prediction: Dict[str, object], actual_home: int, actual_away: int, limit: int) -> bool:
+    raw_top = prediction.get("top_scores") or []
+    top_scores: List[Tuple[int, int, float]] = []
+    for item in raw_top:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            top_scores.append((int(item[0]), int(item[1]), float(item[2]) if len(item) > 2 else 0.0))
+    if limit > len(top_scores):
+        ranked = ranked_scores(prediction, limit)
+        seen = {(h, a) for h, a, _ in top_scores}
+        for home, away, prob in ranked:
+            if (home, away) not in seen:
+                top_scores.append((home, away, prob))
+                if len(top_scores) >= limit:
+                    break
+    for home, away, _prob in top_scores[:limit]:
         if int(home) == actual_home and int(away) == actual_away:
             return True
     return False
@@ -590,10 +613,85 @@ def metric_summary(values: List[float]) -> Optional[float]:
     return sum(values) / len(values) if values else None
 
 
-def score_metric_summary(reviewed: List[Dict[str, object]], exact_hits: int, top3_hits: int) -> Dict[str, object]:
+def safe_float(value: object) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def settled_direction(units: float, positive_label: str, negative_label: str) -> str:
+    if units > 0:
+        return positive_label
+    if units < 0:
+        return negative_label
+    return "push"
+
+
+def score_market_direction_diagnosis(prediction_row: Dict[str, object], actual_home: int, actual_away: int) -> Dict[str, object]:
+    result: Dict[str, object] = {}
+
+    total_line = safe_float(prediction_row.get("total_goals_line"))
+    total_probs = prediction_row.get("total_goals_probabilities")
+    if total_line is not None and isinstance(total_probs, dict):
+        over_prob = float(total_probs.get("over_full_win", 0.0) or 0.0) + float(total_probs.get("over_half_win", 0.0) or 0.0)
+        under_prob = float(total_probs.get("over_full_loss", 0.0) or 0.0) + float(total_probs.get("over_half_loss", 0.0) or 0.0)
+        model_direction = "over" if over_prob >= under_prob else "under"
+        actual_units = total_goals_return_units(actual_home, actual_away, total_line)
+        actual_direction = settled_direction(actual_units, "over", "under")
+        result.update(
+            {
+                "total_goals_line": total_line,
+                "total_goals_model_direction": model_direction,
+                "total_goals_actual_direction": actual_direction,
+                "total_goals_direction_hit": None if actual_direction == "push" else model_direction == actual_direction,
+                "total_goals_model_over_probability": over_prob,
+                "total_goals_model_under_probability": under_prob,
+            }
+        )
+
+    asian_line = safe_float(prediction_row.get("asian_handicap_line"))
+    asian_probs = prediction_row.get("asian_handicap_probabilities")
+    if asian_line is not None and isinstance(asian_probs, dict):
+        home_cover_prob = float(asian_probs.get("home_full_win", 0.0) or 0.0) + float(asian_probs.get("home_half_win", 0.0) or 0.0)
+        away_cover_prob = float(asian_probs.get("home_full_loss", 0.0) or 0.0) + float(asian_probs.get("home_half_loss", 0.0) or 0.0)
+        model_direction = "home_cover" if home_cover_prob >= away_cover_prob else "away_cover"
+        actual_units = asian_handicap_return_units(actual_home, actual_away, asian_line)
+        actual_direction = settled_direction(actual_units, "home_cover", "away_cover")
+        result.update(
+            {
+                "asian_handicap_line": asian_line,
+                "asian_handicap_model_direction": model_direction,
+                "asian_handicap_actual_direction": actual_direction,
+                "asian_handicap_direction_hit": None if actual_direction == "push" else model_direction == actual_direction,
+                "asian_handicap_model_home_cover_probability": home_cover_prob,
+                "asian_handicap_model_away_cover_probability": away_cover_prob,
+            }
+        )
+
+    return result
+
+
+def direction_hit_summary(reviewed: List[Dict[str, object]], field: str) -> Dict[str, object]:
+    rows = [row for row in reviewed if isinstance(row.get(field), bool)]
+    if not rows:
+        return {"sample_size": 0, "hit_rate": None, "hit_count": 0, "miss_count": 0}
+    hits = sum(1 for row in rows if bool(row.get(field)))
+    return {
+        "sample_size": len(rows),
+        "hit_rate": hits / len(rows),
+        "hit_count": hits,
+        "miss_count": len(rows) - hits,
+    }
+
+
+def score_metric_summary(reviewed: List[Dict[str, object]], exact_hits: int, top3_hits: int, top5_hits: Optional[int] = None) -> Dict[str, object]:
     total_errors = [float(row["total_goals_error"]) for row in reviewed if row.get("total_goals_error") is not None]
     diff_errors = [float(row["goal_diff_error"]) for row in reviewed if row.get("goal_diff_error") is not None]
     labels = [label for row in reviewed for label in row.get("score_diagnosis", [])]
+    top5_hit_count = top5_hits if top5_hits is not None else sum(1 for row in reviewed if row.get("top5_hit"))
 
     def label_rate(label: str) -> float:
         return labels.count(label) / len(reviewed) if reviewed else 0.0
@@ -601,10 +699,13 @@ def score_metric_summary(reviewed: List[Dict[str, object]], exact_hits: int, top
     return {
         "exact_score_accuracy": (exact_hits / len(reviewed)) if reviewed else 0.0,
         "top3_hit_rate": (top3_hits / len(reviewed)) if reviewed else 0.0,
+        "top5_hit_rate": (top5_hit_count / len(reviewed)) if reviewed else 0.0,
         "avg_total_goals_error": metric_summary(total_errors),
         "avg_abs_total_goals_error": metric_summary([abs(value) for value in total_errors]),
         "avg_goal_diff_error": metric_summary(diff_errors),
         "avg_abs_goal_diff_error": metric_summary([abs(value) for value in diff_errors]),
+        "total_goals_direction": direction_hit_summary(reviewed, "total_goals_direction_hit"),
+        "asian_handicap_direction": direction_hit_summary(reviewed, "asian_handicap_direction_hit"),
         "underestimated_total_goals_rate": label_rate("underestimated_total_goals"),
         "overestimated_total_goals_rate": label_rate("overestimated_total_goals"),
         "underestimated_draw_rate": label_rate("underestimated_draw"),
@@ -889,6 +990,12 @@ def build_advice(summary: Dict[str, object], reviewed: List[Dict[str, object]]) 
     if score_top3 is not None and score_top3 < 0.35:
         advice.append("比分 Top3 命中率偏低，需复查 lambda 过强/过弱以及低比分重排规则。")
     score_metrics = summary.get("score_metrics", {}) if isinstance(summary.get("score_metrics"), dict) else {}
+    total_direction = score_metrics.get("total_goals_direction", {}) if isinstance(score_metrics.get("total_goals_direction"), dict) else {}
+    asian_direction = score_metrics.get("asian_handicap_direction", {}) if isinstance(score_metrics.get("asian_handicap_direction"), dict) else {}
+    if total_direction.get("sample_size") and total_direction.get("hit_rate") is not None and float(total_direction.get("hit_rate", 0.0)) < 0.45:
+        advice.append("大小球方向命中率偏低，应优先检查总进球 lambda 与大小球盘口融合规则。")
+    if asian_direction.get("sample_size") and asian_direction.get("hit_rate") is not None and float(asian_direction.get("hit_rate", 0.0)) < 0.45:
+        advice.append("亚盘方向命中率偏低，应优先检查净胜球差 lambda 与让球盘口融合规则。")
     if score_metrics.get("underestimated_total_goals_rate", 0.0) >= 0.25:
         advice.append("低估总进球的场次占比较高，应检查总进球 lambda 和大比分尾部权重。")
     if score_metrics.get("underestimated_draw_rate", 0.0) >= 0.25:
@@ -990,10 +1097,13 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         "fused_logloss": fused_stats["logloss"],
         "score_exact_accuracy": summary["score_metrics"]["exact_score_accuracy"],
         "score_top3_hit_rate": summary["score_metrics"]["top3_hit_rate"],
+        "score_top5_hit_rate": summary["score_metrics"].get("top5_hit_rate"),
         "avg_total_goals_error": summary["score_metrics"].get("avg_total_goals_error"),
         "avg_abs_total_goals_error": summary["score_metrics"].get("avg_abs_total_goals_error"),
         "avg_goal_diff_error": summary["score_metrics"].get("avg_goal_diff_error"),
         "avg_abs_goal_diff_error": summary["score_metrics"].get("avg_abs_goal_diff_error"),
+        "total_goals_direction_metrics": summary["score_metrics"].get("total_goals_direction"),
+        "asian_handicap_direction_metrics": summary["score_metrics"].get("asian_handicap_direction"),
         "underestimated_total_goals_rate": summary["score_metrics"].get("underestimated_total_goals_rate"),
         "underestimated_draw_rate": summary["score_metrics"].get("underestimated_draw_rate"),
         "underestimated_underdog_goal_rate": summary["score_metrics"].get("underestimated_underdog_goal_rate"),
@@ -1008,6 +1118,7 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         config["calibration"]["full_playback_model_brier"] = full_model_stats.get("brier")
         config["calibration"]["full_playback_model_logloss"] = full_model_stats.get("logloss")
         config["calibration"]["full_playback_score_top3_hit_rate"] = full_score_metrics.get("top3_hit_rate")
+        config["calibration"]["full_playback_score_top5_hit_rate"] = full_score_metrics.get("top5_hit_rate")
 
     if sample_size < 100:
         config["model_weight"] = config.get("model_weight", 0.4)
@@ -1139,6 +1250,7 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
         f"- 成功匹配赛前预测：{summary['reviewed_matches']} 场",
         f"- 比分 Exact：{summary['score_metrics']['exact_score_accuracy']:.1%}",
         f"- 比分 Top3：{summary['score_metrics']['top3_hit_rate']:.1%}",
+        f"- 比分 Top5：{summary['score_metrics']['top5_hit_rate']:.1%}",
         f"- WDL 模型方向准确率：{model_stats['accuracy']:.1%}" if model_stats["accuracy"] is not None else "- WDL 模型方向准确率：暂无",
         f"- AI 修正前 WDL 准确率：{summary['probability_metrics']['base']['accuracy']:.1%}" if summary['probability_metrics']['base']['accuracy'] is not None else "- AI 修正前 WDL 准确率：暂无",
         f"- 模型 Brier：{model_stats['brier']:.4f}" if model_stats["brier"] is not None else "- 模型 Brier：暂无",
@@ -1156,6 +1268,7 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
         f"- 回放样本：{summary.get('full_playback', {}).get('sample_size', 0)} 场（使用当前模型回放，非真实赛前快照）。",
         f"- 回放 WDL 准确率：{summary.get('full_playback', {}).get('probability_metrics', {}).get('model', {}).get('accuracy'):.1%}" if summary.get('full_playback', {}).get('probability_metrics', {}).get('model', {}).get('accuracy') is not None else "- 回放 WDL 准确率：暂无",
         f"- 回放比分 Top3：{summary.get('full_playback', {}).get('score_metrics', {}).get('top3_hit_rate'):.1%}" if summary.get('full_playback', {}).get('score_metrics', {}).get('top3_hit_rate') is not None else "- 回放比分 Top3：暂无",
+        f"- 回放比分 Top5：{summary.get('full_playback', {}).get('score_metrics', {}).get('top5_hit_rate'):.1%}" if summary.get('full_playback', {}).get('score_metrics', {}).get('top5_hit_rate') is not None else "- 回放比分 Top5：暂无",
         "",
         "## 1.2 比分诊断",
         "",
@@ -1163,6 +1276,8 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
         f"- 平均总进球绝对误差：{summary['score_metrics'].get('avg_abs_total_goals_error'):.2f}" if summary['score_metrics'].get('avg_abs_total_goals_error') is not None else "- 平均总进球绝对误差：暂无",
         f"- 平均净胜球误差：{summary['score_metrics'].get('avg_goal_diff_error'):.2f}" if summary['score_metrics'].get('avg_goal_diff_error') is not None else "- 平均净胜球误差：暂无",
         f"- 平均净胜球绝对误差：{summary['score_metrics'].get('avg_abs_goal_diff_error'):.2f}" if summary['score_metrics'].get('avg_abs_goal_diff_error') is not None else "- 平均净胜球绝对误差：暂无",
+        f"- 大小球方向命中：{summary['score_metrics'].get('total_goals_direction', {}).get('hit_rate'):.1%}（样本 {summary['score_metrics'].get('total_goals_direction', {}).get('sample_size')}）" if summary['score_metrics'].get('total_goals_direction', {}).get('hit_rate') is not None else "- 大小球方向命中：暂无样本",
+        f"- 亚盘方向命中：{summary['score_metrics'].get('asian_handicap_direction', {}).get('hit_rate'):.1%}（样本 {summary['score_metrics'].get('asian_handicap_direction', {}).get('sample_size')}）" if summary['score_metrics'].get('asian_handicap_direction', {}).get('hit_rate') is not None else "- 亚盘方向命中：暂无样本",
         f"- 低估总进球：{summary['score_metrics'].get('underestimated_total_goals_rate', 0.0):.1%}",
         f"- 高估总进球：{summary['score_metrics'].get('overestimated_total_goals_rate', 0.0):.1%}",
         f"- 低估平局：{summary['score_metrics'].get('underestimated_draw_rate', 0.0):.1%}",
@@ -1281,6 +1396,7 @@ def main() -> int:
     reviewed = []
     exact_hits = 0
     top3_hits = 0
+    top5_hits = 0
 
     for actual in results:
         key = (str(actual.get("match_time", "")), str(actual.get("home_team", "")), str(actual.get("away_team", "")))
@@ -1294,8 +1410,10 @@ def main() -> int:
         prediction = prediction_row.get("score_prediction") or {}
         exact = top1_hit(prediction, actual_home, actual_away)
         top3 = top3_hit(prediction, actual_home, actual_away)
+        top5 = top5_hit(prediction, actual_home, actual_away)
         exact_hits += 1 if exact else 0
         top3_hits += 1 if top3 else 0
+        top5_hits += 1 if top5 else 0
         model_probs = normalize_probs(prediction_row.get("probabilities"))
         base_probs = normalize_probs(prediction_row.get("base_probabilities")) or model_probs
         context_probs = normalize_probs(prediction_row.get("context_adjusted_probabilities")) or model_probs
@@ -1305,6 +1423,7 @@ def main() -> int:
         market_probs = normalize_probs(prediction_row.get("market_probabilities")) or market_probs_from_odds(prediction_row.get("normal_odds"))
         fused_probs = normalize_probs(prediction_row.get("fused_probabilities")) or model_probs
         diagnosis = score_diagnosis(prediction, actual_home, actual_away, model_probs)
+        market_score_diagnosis = score_market_direction_diagnosis(prediction_row, actual_home, actual_away)
         ai_adjustment = prediction_row.get("ai_adjustment") or {}
         mistake_tags = outcome_mistake_tags(
             outcome_idx,
@@ -1347,6 +1466,8 @@ def main() -> int:
                 "predicted_top3": prediction.get("top_scores") or [],
                 "exact_hit": exact,
                 "top3_hit": top3,
+                "top5_hit": top5,
+                **market_score_diagnosis,
                 **diagnosis,
             }
         )
@@ -1358,7 +1479,7 @@ def main() -> int:
         "snapshots_scanned": len(snapshot_files()),
         "results_loaded": len(results),
         "reviewed_matches": len(reviewed),
-        "score_metrics": score_metric_summary(reviewed, exact_hits, top3_hits),
+        "score_metrics": score_metric_summary(reviewed, exact_hits, top3_hits, top5_hits),
         "probability_metrics": {
             "base": probability_stats(reviewed, "base_model_probabilities"),
             "context": probability_stats(reviewed, "context_adjusted_probabilities"),
@@ -1375,6 +1496,7 @@ def main() -> int:
                 full_playback,
                 sum(1 for row in full_playback if row.get("exact_hit")),
                 sum(1 for row in full_playback if row.get("top3_hit")),
+                sum(1 for row in full_playback if row.get("top5_hit")),
             ),
             "probability_metrics": {
                 "model": probability_stats(full_playback, "model_probabilities"),
@@ -1400,6 +1522,7 @@ def main() -> int:
     print(f"Full playback matches: {summary['full_playback']['sample_size']}")
     print(f"Exact score accuracy: {summary['score_metrics']['exact_score_accuracy']:.4f}")
     print(f"Top3 hit rate: {summary['score_metrics']['top3_hit_rate']:.4f}")
+    print(f"Top5 hit rate: {summary['score_metrics']['top5_hit_rate']:.4f}")
     print(f"Model WDL accuracy: {summary['probability_metrics']['model']['accuracy']}")
     print(f"Review written: {out_path}")
     print(f"Reflection written: {reflection_path}")
