@@ -2134,6 +2134,25 @@ def merge_candidate_rows(primary_rows: List[dict], extra_rows: List[dict]) -> Li
     return sorted(merged.values(), key=lambda item: (item.get("match_time", ""), item.get("home", ""), item.get("away", "")))
 
 
+def worldcup_team_names(model: Dict[Tuple[str, str], Tuple[float, float, float]]) -> set[str]:
+    teams: set[str] = set()
+    for home, away in model:
+        teams.add(normalize_text(home))
+        teams.add(normalize_text(away))
+    return teams
+
+
+def filter_worldcup_rows(rows: List[dict], model: Dict[Tuple[str, str], Tuple[float, float, float]]) -> List[dict]:
+    teams = worldcup_team_names(model)
+    filtered: List[dict] = []
+    for row in rows:
+        home = normalize_text(str(row.get("home", "")))
+        away = normalize_text(str(row.get("away", "")))
+        if home in teams and away in teams:
+            filtered.append(row)
+    return filtered
+
+
 def apply_external_asian_markets(
     rows: List[dict],
     markets: Dict[Tuple[str, str, str], dict],
@@ -3209,6 +3228,7 @@ def main() -> int:
     if total_goals_markets:
         apply_external_total_goals_markets(rows, total_goals_markets, risk_config)
     generated_at = dt.datetime.now()
+    rows = filter_worldcup_rows(rows, model)
     rows = filter_nearby_rows(rows, generated_at, days=args.days)
     attach_odds_history(rows, generated_at)
     if not rows:

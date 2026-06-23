@@ -41,6 +41,7 @@ from worldcup_agent import (  # noqa: E402
     build_team_aliases,
     calibrate_wdl_probabilities,
     filter_nearby_rows,
+    filter_worldcup_rows,
     generate_report,
     handicap_probabilities_from_score_prediction,
     load_calibration_snapshot,
@@ -334,6 +335,16 @@ class ReportFlowTests(unittest.TestCase):
         ]
         filtered = filter_nearby_rows(rows, dt.datetime(2026, 6, 22, 8, 0))
         self.assertEqual([row["home"] for row in filtered], ["A"])
+
+    def test_filter_worldcup_rows_removes_non_worldcup_matches(self):
+        model = {("葡萄牙", "乌兹别克"): (0.7, 0.2, 0.1), ("英格兰", "加纳"): (0.65, 0.22, 0.13)}
+        rows = [
+            {"home": "葡萄牙", "away": "乌兹别克"},
+            {"home": "库普斯", "away": "埃尔维斯"},
+            {"home": "英格兰", "away": "加纳"},
+        ]
+        filtered = filter_worldcup_rows(rows, model)
+        self.assertEqual([(row["home"], row["away"]) for row in filtered], [("葡萄牙", "乌兹别克"), ("英格兰", "加纳")])
 
     def test_result_pick_uses_highest_fused_probability(self):
         row = {"probabilities": (0.40, 0.25, 0.35), "fused_probabilities": (0.38, 0.24, 0.38)}
