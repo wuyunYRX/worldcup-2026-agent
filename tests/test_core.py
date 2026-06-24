@@ -17,15 +17,20 @@ from review_completed_matches import (  # noqa: E402
     adjustment_module_metrics,
     apply_weather_adjustment_tuning,
     brier,
+    counterfactual_score_parameter_grid,
+    counterfactual_score_value,
     logloss,
     market_probs_from_odds,
     mistake_tag_summary,
     odds_movement_summary,
     odds_outcome_cross_metrics,
     outcome_mistake_tags,
+    score_metric_delta,
     score_diagnosis,
     score_market_direction_diagnosis,
     score_metric_summary,
+    top5_to_top3_diagnosis,
+    top5_to_top3_summary,
     top1_hit,
     top3_hit,
     top5_hit,
@@ -39,6 +44,10 @@ from worldcup_agent import (  # noqa: E402
     asian_handicap_value_metrics,
     apply_value_metrics,
     build_group_standings,
+    enrich_prematch_with_group_motivation,
+    group_motivation_context,
+    historical_feature_context,
+    historical_match_records,
     safe_odds_triplet,
     calibrate_lambdas_with_score_markets,
     build_team_aliases,
@@ -56,9 +65,13 @@ from worldcup_agent import (  # noqa: E402
     parse_zgzcw_ypdb_market,
     parse_total_goals_source,
     parse_zgzcw_dxdb_market,
+    predicted_outcome,
+    promote_top5_to_top3,
     prioritize_primary_rows,
     result_pick_text,
     resolve_team_name,
+    rerank_score_grid,
+    score_grid,
     total_goals_probabilities_from_score_grid,
     total_goals_return_units,
     total_goals_value_metrics,
@@ -234,6 +247,124 @@ class CoreMathTests(unittest.TestCase):
         self.assertIn("target_total_goals_from_market", meta)
         self.assertIn("target_goal_diff_from_market", meta)
 
+        shrunk_home, shrunk_away, shrink_meta = calibrate_lambdas_with_score_markets(
+            2.0,
+            0.8,
+            score_goal_diff_shrink=0.10,
+        )
+        self.assertLess(shrunk_home - shrunk_away, 1.2)
+        self.assertIn("goal_diff_shrink", shrink_meta)
+
+    def test_top5_to_top3_diagnosis(self):
+        prediction = {
+            "top_scores": [(1, 0, 0.30), (2, 0, 0.20), (1, 1, 0.15)],
+            "score_grid": [(1, 0, 0.30), (2, 0, 0.20), (1, 1, 0.15), (2, 1, 0.12), (3, 1, 0.10)],
+        }
+        diagnosis = top5_to_top3_diagnosis(prediction, 2, 1)
+        self.assertEqual(diagnosis["candidate_rank"], 4)
+        self.assertIn("top5_only_hit", diagnosis["top5_to_top3_diagnosis"])
+
+        summary = top5_to_top3_summary([
+            {"actual_score": "2-1", "top3_hit": False, "top5_hit": True, "top5_to_top3_diagnosis": diagnosis["top5_to_top3_diagnosis"]}
+        ])
+        self.assertEqual(summary["top5_only_btts_count"], 1)
+        self.assertEqual(summary["top5_only_higher_total_count"], 1)
+
+    def test_btts_promotion_boosts_both_score_rows(self):
+        base_grid = score_grid(1.5, 1.2, max_goals=4)
+        plain = rerank_score_grid(base_grid, 1.5, 1.2, 0.42, 0.28, 0.30)
+        boosted = rerank_score_grid(
+            base_grid,
+            1.5,
+            1.2,
+            0.42,
+            0.28,
+            0.30,
+            btts_promotion_weight=0.08,
+            high_total_promotion_weight=0.04,
+            btts_total_threshold=2.4,
+        )
+
+        def prob_of(rows, score):
+            return next(prob for home, away, prob in rows if (home, away) == score)
+
+        self.assertGreater(prob_of(boosted, (2, 1)), prob_of(plain, (2, 1)))
+
+    def test_open_game_direct_boost_only_affects_open_games(self):
+        ranked_scores = [
+            (1, 1, 0.120),
+            (2, 1, 0.096),
+            (1, 0, 0.070),
+            (2, 0, 0.068),
+            (1, 2, 0.066),
+        ]
+
+        low_total = promote_top5_to_top3(
+            ranked_scores,
+            1.4,
+            1.3,
+            0.42,
+            0.28,
+            0.30,
+            open_game_top5_gap_ratio=0.92,
+            open_game_top5_direct_boost=0.08,
+        )
+        open_total = promote_top5_to_top3(
+            ranked_scores,
+            1.6,
+            1.4,
+            0.42,
+            0.28,
+            0.30,
+            open_game_top5_gap_ratio=0.92,
+            open_game_top5_direct_boost=0.08,
+        )
+
+        self.assertEqual(low_total, ranked_scores[:3])
+        self.assertIn((2, 0, 0.068), open_total)
+        self.assertNotIn((1, 0, 0.070), open_total)
+
+    def test_counterfactual_score_grid_helpers(self):
+        grid = counterfactual_score_parameter_grid()
+        self.assertTrue(grid)
+        self.assertIn("score_goal_diff_shrink", grid[0])
+        better = counterfactual_score_value(
+            {
+                "exact_score_accuracy": 0.2,
+                "top3_hit_rate": 0.4,
+                "top5_hit_rate": 0.5,
+                "avg_abs_total_goals_error": 1.2,
+                "avg_abs_goal_diff_error": 1.0,
+            }
+        )
+        worse = counterfactual_score_value(
+            {
+                "exact_score_accuracy": 0.1,
+                "top3_hit_rate": 0.2,
+                "top5_hit_rate": 0.3,
+                "avg_abs_total_goals_error": 2.0,
+                "avg_abs_goal_diff_error": 1.8,
+            }
+        )
+        self.assertGreater(better, worse)
+
+    def test_score_metric_delta(self):
+        delta = score_metric_delta(
+            {
+                "top3_hit_rate": 0.25,
+                "top5_hit_rate": 0.40,
+                "avg_abs_total_goals_error": 1.80,
+            },
+            {
+                "top3_hit_rate": 0.35,
+                "top5_hit_rate": 0.45,
+                "avg_abs_total_goals_error": 1.55,
+            },
+        )
+        self.assertAlmostEqual(delta["top3_hit_rate"], 0.10)
+        self.assertAlmostEqual(delta["top5_hit_rate"], 0.05)
+        self.assertAlmostEqual(delta["avg_abs_total_goals_error"], -0.25)
+
 
 class ReportFlowTests(unittest.TestCase):
     def test_load_venue_config_and_match_weather_merge(self):
@@ -333,6 +464,7 @@ class ReportFlowTests(unittest.TestCase):
             item = build_weather_entry(
                 {"match_time": "2026-06-23 01:00", "home": "阿根廷", "away": "奥地利"},
                 {"venue_name": "示例球场", "venue_city": "示例城市", "latitude": 31.0, "longitude": -97.0, "timezone": "America/Chicago"},
+                now=dt.datetime(2026, 6, 20, 12, 0),
             )
         finally:
             build_weather_entry.__globals__["fetch_json"] = original
@@ -402,7 +534,18 @@ class ReportFlowTests(unittest.TestCase):
         self.assertEqual(metrics["from_previous"]["home"]["sample_size"], 1)
 
     def test_calibration_and_one_day_window(self):
-        calibrated = calibrate_wdl_probabilities((0.70, 0.20, 0.10))
+        calibrated = calibrate_wdl_probabilities(
+            (0.70, 0.20, 0.10),
+            {
+                "draw_probability_floor": 0.22,
+                "balanced_match_draw_floor": 0.26,
+                "strong_favorite_draw_floor": 0.25,
+                "max_draw_calibration_boost": 0.08,
+                "underdog_probability_floor": 0.18,
+                "max_underdog_calibration_boost": 0.03,
+                "probability_temperature": 1.0,
+            },
+        )
         self.assertAlmostEqual(calibrated[0], 0.62)
         self.assertAlmostEqual(calibrated[1], 0.25)
         self.assertAlmostEqual(calibrated[2], 0.13)
@@ -412,6 +555,11 @@ class ReportFlowTests(unittest.TestCase):
         ]
         filtered = filter_nearby_rows(rows, dt.datetime(2026, 6, 22, 8, 0))
         self.assertEqual([row["home"] for row in filtered], ["A"])
+
+    def test_probability_temperature_sharpens_favorite(self):
+        neutral = calibrate_wdl_probabilities((0.55, 0.25, 0.20), {"probability_temperature": 1.0})
+        sharpened = calibrate_wdl_probabilities((0.55, 0.25, 0.20), {"probability_temperature": 0.85})
+        self.assertGreater(sharpened[0], neutral[0])
 
     def test_filter_worldcup_rows_removes_non_worldcup_matches(self):
         model = {("葡萄牙", "乌兹别克"): (0.7, 0.2, 0.1), ("英格兰", "加纳"): (0.65, 0.22, 0.13)}
@@ -426,6 +574,20 @@ class ReportFlowTests(unittest.TestCase):
     def test_result_pick_uses_highest_fused_probability(self):
         row = {"probabilities": (0.40, 0.25, 0.35), "fused_probabilities": (0.38, 0.24, 0.38)}
         self.assertTrue(result_pick_text(row).startswith("主胜"))
+
+    def test_predicted_outcome_draw_override(self):
+        row = {
+            "fused_probabilities": (0.40, 0.28, 0.32),
+            "prediction_rule_config": {
+                "draw_pick_override_enabled": True,
+                "draw_pick_min_probability": 0.26,
+                "draw_pick_max_gap_to_favorite": 0.15,
+                "draw_pick_favorite_max_probability": 0.50,
+            },
+        }
+        idx, probability, _margin = predicted_outcome(row)
+        self.assertEqual(idx, 1)
+        self.assertAlmostEqual(probability, 0.28)
 
     def test_handicap_probabilities_from_score_prediction(self):
         prediction = {"score_grid": [(2, 0, 0.4), (1, 0, 0.2), (1, 1, 0.2), (0, 1, 0.2)]}
@@ -618,6 +780,53 @@ class ReportFlowTests(unittest.TestCase):
             standings, best_thirds = build_group_standings(path)
         self.assertEqual(standings[0]["team"], "墨西哥")
         self.assertEqual(best_thirds[0]["team"], "捷克")
+
+    def test_historical_feature_context_from_finished_matches(self):
+        payload = {
+            "matches": [
+                {"status": "FINISHED", "utcDate": "2026-06-11T19:00:00Z", "homeTeam": {"name": "Mexico"}, "awayTeam": {"name": "South Africa"}, "score": {"fullTime": {"home": 2, "away": 0}}},
+                {"status": "FINISHED", "utcDate": "2026-06-15T19:00:00Z", "homeTeam": {"name": "Mexico"}, "awayTeam": {"name": "Czechia"}, "score": {"fullTime": {"home": 1, "away": 1}}},
+                {"status": "FINISHED", "utcDate": "2026-06-15T22:00:00Z", "homeTeam": {"name": "South Africa"}, "awayTeam": {"name": "South Korea"}, "score": {"fullTime": {"home": 0, "away": 3}}},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "matches.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            records = historical_match_records(path)
+            context = historical_feature_context("墨西哥", "韩国", "2026-06-19 03:00", path)
+        self.assertEqual(len(records), 3)
+        self.assertAlmostEqual(context["home_last5_goals_for"], 1.5)
+        self.assertAlmostEqual(context["home_last5_goals_against"], 0.5)
+        self.assertAlmostEqual(context["away_last5_goals_for"], 3.0)
+        self.assertAlmostEqual(context["away_last5_goals_against"], 0.0)
+        self.assertGreater(context["home_rest_days"], 0.0)
+        self.assertLessEqual(context["home_rest_days"], 7.0)
+
+    def test_historical_feature_context_missing_data_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "matches.json"
+            path.write_text(json.dumps({"matches": []}), encoding="utf-8")
+            context = historical_feature_context("阿根廷", "奥地利", "2026-06-23 01:00", path)
+        self.assertEqual(context["home_last5_goals_for"], 0.0)
+        self.assertEqual(context["away_rest_days"], 0.0)
+
+    def test_group_motivation_context_marks_must_win_pressure(self):
+        payload = {
+            "matches": [
+                {"status": "FINISHED", "stage": "GROUP_STAGE", "group": "GROUP_A", "homeTeam": {"name": "Mexico"}, "awayTeam": {"name": "South Africa"}, "score": {"fullTime": {"home": 2, "away": 0}}},
+                {"status": "FINISHED", "stage": "GROUP_STAGE", "group": "GROUP_A", "homeTeam": {"name": "Mexico"}, "awayTeam": {"name": "South Korea"}, "score": {"fullTime": {"home": 1, "away": 0}}},
+                {"status": "FINISHED", "stage": "GROUP_STAGE", "group": "GROUP_A", "homeTeam": {"name": "Czechia"}, "awayTeam": {"name": "South Africa"}, "score": {"fullTime": {"home": 1, "away": 1}}},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "matches.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            context = group_motivation_context("南非", "墨西哥", path)
+            enriched = enrich_prematch_with_group_motivation({}, "南非", "墨西哥", path)
+        self.assertTrue(context["applied"])
+        self.assertEqual(context["home_auto_must_win_flag"], 1.0)
+        self.assertEqual(enriched["must_win_flag_home"], 1)
+        self.assertIn("出线压力", enriched["group_motivation_summary"])
 
     def test_outcome_mistake_tags_identify_wrong_confident_pick(self):
         tags = outcome_mistake_tags(

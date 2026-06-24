@@ -41,12 +41,13 @@ DEFAULT_ASIAN_HANDICAP_PATH = ROOT / "data" / "raw" / "asian_handicap_markets.js
 DEFAULT_TOTAL_GOALS_PATH = ROOT / "data" / "raw" / "total_goals_markets.json"
 WC2026_RESULTS_PATH = ROOT / "data" / "raw" / "wc2026_football_data_matches.json"
 OUTCOME_NAMES = ["主胜", "平", "客胜"]
-DRAW_PROBABILITY_FLOOR = 0.22
-BALANCED_MATCH_DRAW_FLOOR = 0.26
-STRONG_FAVORITE_DRAW_FLOOR = 0.25
-MAX_DRAW_CALIBRATION_BOOST = 0.08
-UNDERDOG_PROBABILITY_FLOOR = 0.18
+DRAW_PROBABILITY_FLOOR = 0.20
+BALANCED_MATCH_DRAW_FLOOR = 0.24
+STRONG_FAVORITE_DRAW_FLOOR = 0.24
+MAX_DRAW_CALIBRATION_BOOST = 0.12
+UNDERDOG_PROBABILITY_FLOOR = 0.08
 MAX_UNDERDOG_CALIBRATION_BOOST = 0.03
+PROBABILITY_TEMPERATURE = 0.80
 DEFAULT_RISK_CONFIG = {
     "model_weight": 0.4,
     "kelly_fraction": 0.25,
@@ -61,6 +62,12 @@ DEFAULT_RISK_CONFIG = {
     "max_draw_calibration_boost": MAX_DRAW_CALIBRATION_BOOST,
     "underdog_probability_floor": UNDERDOG_PROBABILITY_FLOOR,
     "max_underdog_calibration_boost": MAX_UNDERDOG_CALIBRATION_BOOST,
+    "probability_temperature": PROBABILITY_TEMPERATURE,
+    "draw_pick_override_enabled": 1.0,
+    "draw_pick_min_probability": 0.24,
+    "draw_pick_max_gap_to_favorite": 0.12,
+    "draw_pick_favorite_max_probability": 0.45,
+    "high_confidence_margin_threshold": 0.30,
     "enable_ai_probability_adjustment": 1.0,
     "ai_probability_max_delta": 0.03,
     "ai_probability_high_confidence_delta": 0.05,
@@ -74,6 +81,22 @@ DEFAULT_RISK_CONFIG = {
     "monte_carlo_lambda_sigma": 0.10,
     "score_candidate_top_n": 5,
     "score_report_top_n": 3,
+    "score_goal_diff_shrink": 0.0,
+    "score_btts_promotion_weight": 0.0,
+    "score_high_total_promotion_weight": 0.0,
+    "score_btts_total_threshold": 2.55,
+    "score_common_result_boost": 0.0,
+    "score_draw_candidate_boost": 0.0,
+    "score_top5_to_top3_btts_boost": 0.0,
+    "score_top5_to_top3_high_total_boost": 0.0,
+    "score_open_game_top5_gap_ratio": 0.0,
+    "score_open_game_top5_direct_boost": 0.0,
+    "score_big_margin_tail_boost": 0.0,
+    "score_lambda_cap": 2.8,
+    "score_lambda_global_scale": 1.5,
+    "score_recent_feature_scale": 0.0,
+    "score_rest_feature_scale": 0.5,
+    "score_historical_lambda_mix": 1.0,
 }
 TEAM_TRANSLATIONS = {
     "Mexico": "墨西哥",
@@ -580,6 +603,197 @@ def build_group_standings(results_path: Path = WC2026_RESULTS_PATH) -> Tuple[Lis
     return standings, best_thirds
 
 
+def group_motivation_context(home: str, away: str, results_path: Path = WC2026_RESULTS_PATH) -> Dict[str, object]:
+    standings, _best_thirds = build_group_standings(results_path)
+    by_team = {str(row.get("team", "")): row for row in standings}
+    context: Dict[str, object] = {"source": "group_standings", "applied": False}
+    summaries: List[str] = []
+    for side, team in (("home", home), ("away", away)):
+        row = by_team.get(team)
+        if not row:
+            continue
+        played = int(row.get("played", 0) or 0)
+        points = int(row.get("points", 0) or 0)
+        rank = int(row.get("rank", 0) or 0)
+        gd = int(row.get("gd", 0) or 0)
+        must_win = 0.0
+        pressure = 0.0
+        rotation_risk = 0.0
+        if played >= 2:
+            if rank >= 3 or points <= 3:
+                must_win = 1.0
+                pressure = 1.0
+            elif rank == 2 and points <= 4:
+                pressure = 0.6
+            if rank == 1 and points >= 6 and gd >= 2:
+                rotation_risk = 0.5
+        elif played == 1 and points == 0:
+            pressure = 0.5
+        context[f"{side}_group"] = row.get("group", "")
+        context[f"{side}_group_rank"] = float(rank)
+        context[f"{side}_group_points"] = float(points)
+        context[f"{side}_group_played"] = float(played)
+        context[f"{side}_group_goal_diff"] = float(gd)
+        context[f"{side}_auto_must_win_flag"] = must_win
+        context[f"{side}_qualification_pressure"] = pressure
+        context[f"{side}_auto_rotation_risk"] = rotation_risk
+        if must_win > 0:
+            summaries.append(f"{team}小组第{rank}、{points}分，出线压力较高")
+        elif pressure > 0:
+            summaries.append(f"{team}小组第{rank}、{points}分，存在抢分压力")
+        elif rotation_risk > 0:
+            summaries.append(f"{team}小组第{rank}、{points}分，存在保守轮换可能")
+    if summaries:
+        context["applied"] = True
+        context["summary"] = "；".join(summaries)
+    return context
+
+
+def enrich_prematch_with_group_motivation(
+    prematch: Optional[Dict[str, object]],
+    home: str,
+    away: str,
+    results_path: Path = WC2026_RESULTS_PATH,
+) -> Optional[Dict[str, object]]:
+    context = group_motivation_context(home, away, results_path)
+    if not context.get("applied"):
+        return prematch
+    enriched: Dict[str, object] = dict(prematch or {})
+    home_auto_must_win = float(str(context.get("home_auto_must_win_flag", 0.0) or 0.0))
+    away_auto_must_win = float(str(context.get("away_auto_must_win_flag", 0.0) or 0.0))
+    if home_auto_must_win >= 1.0 and prematch_float(enriched, "must_win_flag_home") <= 0:
+        enriched["must_win_flag_home"] = 1
+    if away_auto_must_win >= 1.0 and prematch_float(enriched, "must_win_flag_away") <= 0:
+        enriched["must_win_flag_away"] = 1
+    enriched["group_motivation"] = context
+    enriched["group_motivation_summary"] = context.get("summary", "")
+    enriched["group_motivation_source"] = context.get("source", "")
+    return enriched
+
+
+def parse_match_datetime(value: object) -> Optional[dt.datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z") or "T" in text:
+        try:
+            parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(dt.timezone(dt.timedelta(hours=8))).replace(tzinfo=None)
+        return parsed
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%m-%d %H:%M"):
+        try:
+            parsed = dt.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if fmt == "%m-%d %H:%M":
+            parsed = parsed.replace(year=2026)
+        return parsed
+    return None
+
+
+def clamp_feature_value(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def historical_match_records(results_path: Path = WC2026_RESULTS_PATH) -> List[dict]:
+    if not results_path.exists():
+        return []
+    try:
+        payload = json.loads(results_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    records: List[dict] = []
+    for match in payload.get("matches", []):
+        if not isinstance(match, dict) or match.get("status") != "FINISHED":
+            continue
+        score = match.get("score", {}).get("fullTime", {})
+        home_goals = score.get("home")
+        away_goals = score.get("away")
+        kickoff = parse_match_datetime(match.get("utcDate"))
+        home = team_display_name(str(match.get("homeTeam", {}).get("name", "")))
+        away = team_display_name(str(match.get("awayTeam", {}).get("name", "")))
+        if kickoff is None or not home or not away or home_goals is None or away_goals is None:
+            continue
+        try:
+            home_goals_i = int(home_goals)
+            away_goals_i = int(away_goals)
+        except (TypeError, ValueError):
+            continue
+        records.append(
+            {
+                "kickoff": kickoff,
+                "home": home,
+                "away": away,
+                "home_goals": home_goals_i,
+                "away_goals": away_goals_i,
+            }
+        )
+    return sorted(records, key=lambda row: row["kickoff"])
+
+
+def team_recent_goal_summary(records: List[dict], team: str, kickoff: Optional[dt.datetime], limit: int) -> Tuple[float, float, int]:
+    rows: List[Tuple[int, int]] = []
+    for record in records:
+        if kickoff is not None and record["kickoff"] >= kickoff:
+            continue
+        if record["home"] == team:
+            rows.append((int(record["home_goals"]), int(record["away_goals"])))
+        elif record["away"] == team:
+            rows.append((int(record["away_goals"]), int(record["home_goals"])))
+    rows = rows[-limit:]
+    if not rows:
+        return 0.0, 0.0, 0
+    goals_for = sum(item[0] for item in rows) / len(rows)
+    goals_against = sum(item[1] for item in rows) / len(rows)
+    return round(clamp_feature_value(goals_for, 0.0, 5.0), 3), round(clamp_feature_value(goals_against, 0.0, 5.0), 3), len(rows)
+
+
+def team_rest_days(records: List[dict], team: str, kickoff: Optional[dt.datetime]) -> float:
+    if kickoff is None:
+        return 0.0
+    previous = [record["kickoff"] for record in records if record["kickoff"] < kickoff and team in {record["home"], record["away"]}]
+    if not previous:
+        return 0.0
+    days = (kickoff - previous[-1]).total_seconds() / 86400.0
+    return round(clamp_feature_value(days, 0.0, 7.0), 3)
+
+
+def historical_feature_context(home: str, away: str, match_time: str, results_path: Path = WC2026_RESULTS_PATH) -> Dict[str, float]:
+    records = historical_match_records(results_path)
+    kickoff = parse_match_datetime(match_time)
+    home_l5_for, home_l5_against, home_l5_count = team_recent_goal_summary(records, home, kickoff, 5)
+    away_l5_for, away_l5_against, away_l5_count = team_recent_goal_summary(records, away, kickoff, 5)
+    home_l10_for, home_l10_against, home_l10_count = team_recent_goal_summary(records, home, kickoff, 10)
+    away_l10_for, away_l10_against, away_l10_count = team_recent_goal_summary(records, away, kickoff, 10)
+    home_rest_raw = team_rest_days(records, home, kickoff)
+    away_rest_raw = team_rest_days(records, away, kickoff)
+    return {
+        "home_last5_goals_for": home_l5_for,
+        "home_last5_goals_against": home_l5_against,
+        "away_last5_goals_for": away_l5_for,
+        "away_last5_goals_against": away_l5_against,
+        "home_last10_goals_for": home_l10_for,
+        "home_last10_goals_against": home_l10_against,
+        "away_last10_goals_for": away_l10_for,
+        "away_last10_goals_against": away_l10_against,
+        "home_recent_goals_for": home_l5_for,
+        "home_recent_goals_against": home_l5_against,
+        "away_recent_goals_for": away_l5_for,
+        "away_recent_goals_against": away_l5_against,
+        "home_rest_days": home_rest_raw,
+        "away_rest_days": away_rest_raw,
+        "home_rest_days_model": round(home_rest_raw / 7.0, 3),
+        "away_rest_days_model": round(away_rest_raw / 7.0, 3),
+        "home_recent_match_count": float(home_l5_count),
+        "away_recent_match_count": float(away_l5_count),
+        "home_last10_match_count": float(home_l10_count),
+        "away_last10_match_count": float(away_l10_count),
+    }
+
+
 def row_probabilities(row: dict) -> Optional[Tuple[float, float, float]]:
     return row.get("fused_probabilities") or row.get("probabilities")
 
@@ -991,6 +1205,14 @@ def monte_carlo_validate_score_prediction(
             asian_market_probabilities,
             total_goals_line,
             total_goals_market_probabilities,
+            float(risk_config.get("score_btts_promotion_weight", 0.0) or 0.0),
+            float(risk_config.get("score_high_total_promotion_weight", 0.0) or 0.0),
+            float(risk_config.get("score_btts_total_threshold", 2.55) or 2.55),
+            float(risk_config.get("score_common_result_boost", 0.0) or 0.0),
+            float(risk_config.get("score_draw_candidate_boost", 0.0) or 0.0),
+            float(risk_config.get("score_top5_to_top3_btts_boost", 0.0) or 0.0),
+            float(risk_config.get("score_top5_to_top3_high_total_boost", 0.0) or 0.0),
+            float(risk_config.get("score_big_margin_tail_boost", 0.0) or 0.0),
         )
         sampled_home, sampled_away = weighted_score_sample(sim_grid, rng)
         key = (sampled_home, sampled_away)
@@ -1092,6 +1314,14 @@ def rerank_score_grid(
     asian_market_probabilities: Optional[Tuple[float, float]] = None,
     total_goals_line: Optional[float] = None,
     total_goals_market_probabilities: Optional[Tuple[float, float]] = None,
+    btts_promotion_weight: float = 0.0,
+    high_total_promotion_weight: float = 0.0,
+    btts_total_threshold: float = 2.55,
+    common_result_boost: float = 0.0,
+    draw_candidate_boost: float = 0.0,
+    top5_to_top3_btts_boost: float = 0.0,
+    top5_to_top3_high_total_boost: float = 0.0,
+    big_margin_tail_boost: float = 0.0,
 ) -> List[Tuple[int, int, float]]:
     total_goals = lambda_home + lambda_away
     goal_diff = lambda_home - lambda_away
@@ -1100,12 +1330,18 @@ def rerank_score_grid(
     for home_goals, away_goals, prob in grid:
         weight = 1.0
         score_sum = home_goals + away_goals
+        draw_risk = market_draw >= 0.27 and abs(goal_diff) <= 0.45
+        open_game_signal = total_goals >= 2.9
+        underdog_scoring_signal = abs(goal_diff) <= 0.95 and total_goals >= 2.5
+        heavy_favorite_signal = abs(goal_diff) >= 0.95
         if score_sum <= 2:
             weight *= 1.06
         if (home_goals, away_goals) in {(1, 1), (1, 0), (0, 1), (2, 1), (2, 0), (0, 0), (1, 2)}:
-            weight *= 1.05
+            weight *= 1.05 + max(min(float(common_result_boost or 0.0), 0.15), 0.0)
         if home_goals == away_goals and score_sum <= 2:
-            weight *= 1.12
+            weight *= 1.12 + max(min(float(draw_candidate_boost or 0.0), 0.15), 0.0)
+        if draw_risk and home_goals == away_goals and score_sum <= 4:
+            weight *= 1.0 + max(min(float(draw_candidate_boost or 0.0), 0.10), 0.0)
         if (home_goals, away_goals) == (0, 0) and total_goals <= 2.6:
             weight *= 1.10
         if total_goals <= 2.2 and score_sum >= 4:
@@ -1158,11 +1394,93 @@ def rerank_score_grid(
         if goal_diff <= -0.45 and away_goals > home_goals:
             weight *= 1.06
         if abs(goal_diff) >= 0.7 and abs(home_goals - away_goals) >= 2:
-            weight *= 1.04
+            weight *= 1.04 + max(min(float(big_margin_tail_boost or 0.0), 0.12), 0.0)
+        if heavy_favorite_signal and abs(home_goals - away_goals) >= 2 and score_sum >= 3:
+            weight *= 1.0 + max(min(float(big_margin_tail_boost or 0.0), 0.08), 0.0)
+
+        total_expectation = lambda_home + lambda_away
+        over_bias = False
+        if total_goals_market_probabilities:
+            over_prob, under_prob = total_goals_market_probabilities
+            over_bias = over_prob > under_prob
+        balanced_match = abs(market_home - market_away) <= 0.18
+        btts_trigger = total_expectation >= btts_total_threshold or over_bias or balanced_match
+        if btts_trigger and home_goals > 0 and away_goals > 0:
+            weight *= 1.0 + max(min(float(btts_promotion_weight or 0.0), 0.20), 0.0)
+            if home_goals + away_goals >= 3:
+                weight *= 1.0 + max(min(float(high_total_promotion_weight or 0.0), 0.15), 0.0)
+        if home_goals > 0 and away_goals > 0 and score_sum in {2, 3, 4}:
+            weight *= 1.0 + max(min(float(top5_to_top3_btts_boost or 0.0), 0.15), 0.0)
+        if score_sum >= 3 and score_sum <= 5:
+            weight *= 1.0 + max(min(float(top5_to_top3_high_total_boost or 0.0), 0.15), 0.0)
+        if open_game_signal and home_goals > 0 and away_goals > 0 and score_sum in {3, 4, 5}:
+            weight *= 1.0 + max(min(float(top5_to_top3_btts_boost or 0.0), 0.08), 0.0)
+        if underdog_scoring_signal:
+            trailing_goals = away_goals if goal_diff > 0 else home_goals
+            if trailing_goals >= 1 and score_sum >= 3:
+                weight *= 1.0 + max(min(float(top5_to_top3_high_total_boost or 0.0), 0.08), 0.0)
         adjusted.append((home_goals, away_goals, prob * weight))
 
     total = sum(prob for _, _, prob in adjusted)
     return [(home_goals, away_goals, prob / total) for home_goals, away_goals, prob in adjusted]
+
+
+def promote_top5_to_top3(
+    ranked_scores: List[Tuple[int, int, float]],
+    lambda_home: float,
+    lambda_away: float,
+    market_home: float,
+    market_draw: float,
+    market_away: float,
+    draw_candidate_boost: float = 0.0,
+    top5_to_top3_btts_boost: float = 0.0,
+    top5_to_top3_high_total_boost: float = 0.0,
+    big_margin_tail_boost: float = 0.0,
+    open_game_top5_gap_ratio: float = 0.0,
+    open_game_top5_direct_boost: float = 0.0,
+) -> List[Tuple[int, int, float]]:
+    candidates = list(ranked_scores[:5])
+    if len(candidates) <= 3:
+        return candidates[:3]
+    goal_diff = lambda_home - lambda_away
+    total_goals = lambda_home + lambda_away
+    draw_risk = market_draw >= 0.27 and abs(goal_diff) <= 0.45
+    open_game_signal = total_goals >= 2.9
+    underdog_scoring_signal = abs(goal_diff) <= 0.95 and total_goals >= 2.5
+    heavy_favorite_signal = abs(goal_diff) >= 0.95
+    top3_cutoff = candidates[2][2]
+    open_game_gap_ratio = max(min(float(open_game_top5_gap_ratio or 0.0), 1.0), 0.0)
+    rescored: List[Tuple[float, int, Tuple[int, int, float]]] = []
+    for idx, item in enumerate(candidates):
+        home_goals, away_goals, prob = item
+        score_sum = home_goals + away_goals
+        bonus = 0.0
+        if draw_risk and home_goals == away_goals and score_sum <= 4:
+            bonus += max(float(draw_candidate_boost or 0.0), 0.0)
+        if open_game_signal and home_goals > 0 and away_goals > 0 and score_sum in {3, 4, 5}:
+            bonus += max(float(top5_to_top3_btts_boost or 0.0), 0.0)
+        if underdog_scoring_signal:
+            trailing_goals = away_goals if goal_diff > 0 else home_goals
+            if trailing_goals >= 1 and score_sum >= 3:
+                bonus += max(float(top5_to_top3_high_total_boost or 0.0), 0.0)
+        if heavy_favorite_signal and abs(home_goals - away_goals) >= 2 and score_sum >= 3:
+            favored_margin = home_goals - away_goals if goal_diff > 0 else away_goals - home_goals
+            if favored_margin >= 2:
+                bonus += max(float(big_margin_tail_boost or 0.0), 0.0)
+        if (
+            open_game_signal
+            and idx >= 3
+            and open_game_gap_ratio > 0.0
+            and top3_cutoff > 0.0
+            and prob >= top3_cutoff * open_game_gap_ratio
+            and home_goals != away_goals
+            and 2 <= score_sum <= 4
+        ):
+            bonus += max(float(open_game_top5_direct_boost or 0.0), 0.0)
+        adjusted_prob = prob * (1.0 + min(bonus, 0.35))
+        rescored.append((adjusted_prob, -idx, item))
+    rescored.sort(reverse=True)
+    return [item for _score, _rank, item in rescored[:3]]
 
 
 def calibrate_lambdas_with_score_markets(
@@ -1172,6 +1490,7 @@ def calibrate_lambdas_with_score_markets(
     asian_market_probabilities: Optional[Tuple[float, float]] = None,
     total_goals_line: Optional[float] = None,
     total_goals_market_probabilities: Optional[Tuple[float, float]] = None,
+    score_goal_diff_shrink: float = 0.0,
 ) -> Tuple[float, float, Dict[str, float]]:
     total_goals = max(lambda_home + lambda_away, 0.1)
     goal_diff = lambda_home - lambda_away
@@ -1198,6 +1517,11 @@ def calibrate_lambdas_with_score_markets(
             adjusted_diff = goal_diff * 0.84 + target_diff * 0.16
             meta["target_goal_diff_from_market"] = target_diff
 
+    shrink = max(min(float(score_goal_diff_shrink or 0.0), 0.30), 0.0)
+    if shrink > 0:
+        adjusted_diff *= 1.0 - shrink
+        meta["goal_diff_shrink"] = shrink
+
     adjusted_diff = max(min(adjusted_diff, adjusted_total - 0.1), -adjusted_total + 0.1)
     new_home = max((adjusted_total + adjusted_diff) / 2.0, 0.05)
     new_away = max((adjusted_total - adjusted_diff) / 2.0, 0.05)
@@ -1219,6 +1543,17 @@ def score_prediction_from_wdl(
     asian_market_probabilities: Optional[Tuple[float, float]] = None,
     total_goals_line: Optional[float] = None,
     total_goals_market_probabilities: Optional[Tuple[float, float]] = None,
+    score_goal_diff_shrink: float = 0.0,
+    btts_promotion_weight: float = 0.0,
+    high_total_promotion_weight: float = 0.0,
+    btts_total_threshold: float = 2.55,
+    common_result_boost: float = 0.0,
+    draw_candidate_boost: float = 0.0,
+    top5_to_top3_btts_boost: float = 0.0,
+    top5_to_top3_high_total_boost: float = 0.0,
+    big_margin_tail_boost: float = 0.0,
+    open_game_top5_gap_ratio: float = 0.0,
+    open_game_top5_direct_boost: float = 0.0,
 ) -> dict:
     """Infer a simple Poisson score model from W/D/L probabilities.
 
@@ -1257,6 +1592,7 @@ def score_prediction_from_wdl(
         asian_market_probabilities,
         total_goals_line,
         total_goals_market_probabilities,
+        score_goal_diff_shrink,
     )
     grid = score_grid(lambda_home, lambda_away, max_goals=7)
     grid = rerank_score_grid(
@@ -1273,8 +1609,30 @@ def score_prediction_from_wdl(
         asian_market_probabilities,
         total_goals_line,
         total_goals_market_probabilities,
+        btts_promotion_weight,
+        high_total_promotion_weight,
+        btts_total_threshold,
+        common_result_boost,
+        draw_candidate_boost,
+        top5_to_top3_btts_boost,
+        top5_to_top3_high_total_boost,
+        big_margin_tail_boost,
     )
-    top_scores = sorted(grid, key=lambda item: item[2], reverse=True)[:3]
+    ranked_top_scores = sorted(grid, key=lambda item: item[2], reverse=True)
+    top_scores = promote_top5_to_top3(
+        ranked_top_scores,
+        lambda_home,
+        lambda_away,
+        probabilities[0],
+        probabilities[1],
+        probabilities[2],
+        draw_candidate_boost,
+        top5_to_top3_btts_boost,
+        top5_to_top3_high_total_boost,
+        big_margin_tail_boost,
+        open_game_top5_gap_ratio,
+        open_game_top5_direct_boost,
+    )
     over_25 = sum(prob for home_goals, away_goals, prob in grid if home_goals + away_goals >= 3)
     both_score = sum(prob for home_goals, away_goals, prob in grid if home_goals > 0 and away_goals > 0)
     return {
@@ -1322,6 +1680,10 @@ def clamp_exp(value: float) -> float:
     return math.exp(max(min(value, 8.0), -8.0))
 
 
+def clamp_goal_lambda(value: float, lower: float = 0.05, upper: float = 4.5) -> float:
+    return max(lower, min(upper, value))
+
+
 def dot(left: Iterable[float], right: Iterable[float]) -> float:
     return sum(a * b for a, b in zip(left, right))
 
@@ -1345,11 +1707,20 @@ def calibrate_wdl_probabilities(probabilities: Tuple[float, float, float], calib
     max_draw_calibration_boost = float(calibration_config.get("max_draw_calibration_boost", MAX_DRAW_CALIBRATION_BOOST))
     underdog_probability_floor = float(calibration_config.get("underdog_probability_floor", UNDERDOG_PROBABILITY_FLOOR))
     max_underdog_calibration_boost = float(calibration_config.get("max_underdog_calibration_boost", MAX_UNDERDOG_CALIBRATION_BOOST))
+    probability_temperature = max(float(calibration_config.get("probability_temperature", PROBABILITY_TEMPERATURE)), 0.05)
     home, draw, away = probabilities
     total = home + draw + away
     if total <= 0:
         return probabilities
     home, draw, away = home / total, draw / total, away / total
+    if abs(probability_temperature - 1.0) > 1e-9:
+        values = [
+            max(home, 1e-9) ** (1.0 / probability_temperature),
+            max(draw, 1e-9) ** (1.0 / probability_temperature),
+            max(away, 1e-9) ** (1.0 / probability_temperature),
+        ]
+        total = sum(values)
+        home, draw, away = values[0] / total, values[1] / total, values[2] / total
 
     favorite_idx = 0 if home >= away else 2
     favorite = max(home, away)
@@ -1536,6 +1907,9 @@ def prematch_adjustments(prematch: Optional[Dict[str, object]]) -> Tuple[float, 
         "weather_severity": weather_severity,
         "weather_summary": prematch.get("weather_summary", "") if prematch else "",
         "weather_source": prematch.get("weather_source", "") if prematch else "",
+        "group_motivation": prematch.get("group_motivation", {}) if prematch else {},
+        "group_motivation_summary": prematch.get("group_motivation_summary", "") if prematch else "",
+        "group_motivation_source": prematch.get("group_motivation_source", "") if prematch else "",
     }
     return home_mul, away_mul, metadata
 
@@ -1565,6 +1939,22 @@ def score_prediction_from_trained_model(
     asian_market_probabilities: Optional[Tuple[float, float]] = None,
     total_goals_line: Optional[float] = None,
     total_goals_market_probabilities: Optional[Tuple[float, float]] = None,
+    score_goal_diff_shrink: float = 0.0,
+    btts_promotion_weight: float = 0.0,
+    high_total_promotion_weight: float = 0.0,
+    btts_total_threshold: float = 2.55,
+    score_lambda_cap: float = 4.5,
+    score_lambda_global_scale: float = 1.0,
+    score_recent_feature_scale: float = 0.0,
+    score_rest_feature_scale: float = 0.0,
+    score_historical_lambda_mix: float = 1.0,
+    score_common_result_boost: float = 0.0,
+    score_draw_candidate_boost: float = 0.0,
+    score_top5_to_top3_btts_boost: float = 0.0,
+    score_top5_to_top3_high_total_boost: float = 0.0,
+    score_big_margin_tail_boost: float = 0.0,
+    score_open_game_top5_gap_ratio: float = 0.0,
+    score_open_game_top5_direct_boost: float = 0.0,
 ) -> Optional[dict]:
     if not score_model:
         return None
@@ -1648,55 +2038,95 @@ def score_prediction_from_trained_model(
         "precipitation_mm": 0.0,
         "weather_severity": 0.0,
     }
+    historical_context = historical_feature_context(home, away, match_time)
     prematch = None
     if prematch_news_index is not None:
         prematch = prematch_news_index.get((normalize_text(match_time), normalize_text(home), normalize_text(away)))
+        prematch = enrich_prematch_with_group_motivation(prematch, home, away)
         if prematch:
-            feature_map["home_injury_count"] = prematch_float(prematch, "home_injury_count")
-            feature_map["away_injury_count"] = prematch_float(prematch, "away_injury_count")
-            feature_map["home_suspension_count"] = prematch_float(prematch, "home_suspension_count")
-            feature_map["away_suspension_count"] = prematch_float(prematch, "away_suspension_count")
-            feature_map["home_lineup_known"] = prematch_float(prematch, "home_lineup_known")
-            feature_map["away_lineup_known"] = prematch_float(prematch, "away_lineup_known")
-            feature_map["home_rotation_flag"] = prematch_float(prematch, "home_rotation_flag")
-            feature_map["away_rotation_flag"] = prematch_float(prematch, "away_rotation_flag")
-            feature_map["must_win_flag_home"] = prematch_float(prematch, "must_win_flag_home")
-            feature_map["must_win_flag_away"] = prematch_float(prematch, "must_win_flag_away")
-            feature_map["home_pressing_level"] = prematch_float(prematch, "home_pressing_level")
-            feature_map["away_pressing_level"] = prematch_float(prematch, "away_pressing_level")
-            feature_map["home_defensive_line"] = prematch_float(prematch, "home_defensive_line")
-            feature_map["away_defensive_line"] = prematch_float(prematch, "away_defensive_line")
-            feature_map["home_tactical_stability"] = prematch_float(prematch, "home_tactical_stability")
-            feature_map["away_tactical_stability"] = prematch_float(prematch, "away_tactical_stability")
-            feature_map["home_transition_risk"] = prematch_float(prematch, "home_transition_risk")
-            feature_map["away_transition_risk"] = prematch_float(prematch, "away_transition_risk")
-            feature_map["tactical_mismatch_home"] = prematch_float(prematch, "tactical_mismatch_home")
-            feature_map["tactical_mismatch_away"] = prematch_float(prematch, "tactical_mismatch_away")
-            feature_map["home_coach_style_counter"] = 1.0 if str(prematch.get("home_coach_style", "")) == "counter" else 0.0
-            feature_map["away_coach_style_counter"] = 1.0 if str(prematch.get("away_coach_style", "")) == "counter" else 0.0
-            feature_map["home_squad_value_eur_m"] = prematch_float(prematch, "home_squad_value_eur_m")
-            feature_map["away_squad_value_eur_m"] = prematch_float(prematch, "away_squad_value_eur_m")
-            feature_map["home_value_ratio"] = prematch_float(prematch, "home_value_ratio")
-            feature_map["away_value_ratio"] = prematch_float(prematch, "away_value_ratio")
-            feature_map["home_big5_league_players"] = prematch_float(prematch, "home_big5_league_players")
-            feature_map["away_big5_league_players"] = prematch_float(prematch, "away_big5_league_players")
-            feature_map["home_squad_depth_score"] = prematch_float(prematch, "home_squad_depth_score")
-            feature_map["away_squad_depth_score"] = prematch_float(prematch, "away_squad_depth_score")
-            feature_map["home_absence_value_loss_eur_m"] = prematch_float(prematch, "home_absence_value_loss_eur_m")
-            feature_map["away_absence_value_loss_eur_m"] = prematch_float(prematch, "away_absence_value_loss_eur_m")
-            feature_map["player_value_mismatch_home"] = prematch_float(prematch, "player_value_mismatch_home")
-            feature_map["player_value_mismatch_away"] = prematch_float(prematch, "player_value_mismatch_away")
-            feature_map["temperature_c"] = prematch_float(prematch, "temperature_c")
-            feature_map["humidity_pct"] = prematch_float(prematch, "humidity_pct")
-            feature_map["wind_kph"] = prematch_float(prematch, "wind_kph")
-            feature_map["precipitation_mm"] = prematch_float(prematch, "precipitation_mm")
-            feature_map["weather_severity"] = prematch_float(prematch, "weather_severity")
-    features = [float(feature_map.get(name, 0.0)) for name in feature_names]
-    lambda_home = clamp_exp(dot(features, home_weights))
-    lambda_away = clamp_exp(dot(features, away_weights))
+            for field in (
+                "home_injury_count",
+                "away_injury_count",
+                "home_suspension_count",
+                "away_suspension_count",
+                "home_lineup_known",
+                "away_lineup_known",
+                "home_rotation_flag",
+                "away_rotation_flag",
+                "must_win_flag_home",
+                "must_win_flag_away",
+                "home_pressing_level",
+                "away_pressing_level",
+                "home_defensive_line",
+                "away_defensive_line",
+                "home_tactical_stability",
+                "away_tactical_stability",
+                "home_transition_risk",
+                "away_transition_risk",
+                "tactical_mismatch_home",
+                "tactical_mismatch_away",
+                "home_squad_value_eur_m",
+                "away_squad_value_eur_m",
+                "home_value_ratio",
+                "away_value_ratio",
+                "home_big5_league_players",
+                "away_big5_league_players",
+                "home_squad_depth_score",
+                "away_squad_depth_score",
+                "home_absence_value_loss_eur_m",
+                "away_absence_value_loss_eur_m",
+                "player_value_mismatch_home",
+                "player_value_mismatch_away",
+                "temperature_c",
+                "humidity_pct",
+                "wind_kph",
+                "precipitation_mm",
+                "weather_severity",
+            ):
+                if field in prematch:
+                    feature_map[field] = prematch_float(prematch, field)
+            if "home_coach_style" in prematch:
+                feature_map["home_coach_style_counter"] = 1.0 if str(prematch.get("home_coach_style", "")) == "counter" else 0.0
+            if "away_coach_style" in prematch:
+                feature_map["away_coach_style_counter"] = 1.0 if str(prematch.get("away_coach_style", "")) == "counter" else 0.0
+    recent_feature_scale = float(score_recent_feature_scale or 0.0)
+    rest_feature_scale = float(score_rest_feature_scale or 0.0)
+    historical_feature_map = dict(feature_map)
+    for key in (
+        "home_last5_goals_for",
+        "home_last5_goals_against",
+        "away_last5_goals_for",
+        "away_last5_goals_against",
+        "home_last10_goals_for",
+        "home_last10_goals_against",
+        "away_last10_goals_for",
+        "away_last10_goals_against",
+        "home_recent_goals_for",
+        "home_recent_goals_against",
+        "away_recent_goals_for",
+        "away_recent_goals_against",
+    ):
+        if key in historical_feature_map:
+            historical_feature_map[key] = float(historical_context.get(key, 0.0) or 0.0) * recent_feature_scale
+    historical_feature_map["home_rest_days"] = float(historical_context.get("home_rest_days_model", 0.0) or 0.0) * rest_feature_scale
+    historical_feature_map["away_rest_days"] = float(historical_context.get("away_rest_days_model", 0.0) or 0.0) * rest_feature_scale
+
+    base_features = [float(feature_map.get(name, 0.0)) for name in feature_names]
+    historical_features = [float(historical_feature_map.get(name, 0.0)) for name in feature_names]
+    base_lambda_home = clamp_exp(dot(base_features, home_weights))
+    base_lambda_away = clamp_exp(dot(base_features, away_weights))
+    historical_lambda_home = clamp_exp(dot(historical_features, home_weights))
+    historical_lambda_away = clamp_exp(dot(historical_features, away_weights))
+    historical_lambda_mix = max(0.0, min(1.0, float(score_historical_lambda_mix or 0.0)))
+    score_lambda_global_scale = max(0.05, float(score_lambda_global_scale or 1.0))
+    score_lambda_cap = max(0.5, float(score_lambda_cap or 4.5))
+    lambda_home = ((1.0 - historical_lambda_mix) * base_lambda_home + historical_lambda_mix * historical_lambda_home) * score_lambda_global_scale
+    lambda_away = ((1.0 - historical_lambda_mix) * base_lambda_away + historical_lambda_mix * historical_lambda_away) * score_lambda_global_scale
     home_mul, away_mul, prematch_meta = prematch_adjustments(prematch)
     lambda_home *= home_mul
     lambda_away *= away_mul
+    lambda_home = clamp_goal_lambda(lambda_home, upper=score_lambda_cap)
+    lambda_away = clamp_goal_lambda(lambda_away, upper=score_lambda_cap)
     lambda_home, lambda_away, market_lambda_meta = calibrate_lambdas_with_score_markets(
         lambda_home,
         lambda_away,
@@ -1704,7 +2134,10 @@ def score_prediction_from_trained_model(
         asian_market_probabilities,
         total_goals_line,
         total_goals_market_probabilities,
+        score_goal_diff_shrink,
     )
+    lambda_home = clamp_goal_lambda(lambda_home, upper=score_lambda_cap)
+    lambda_away = clamp_goal_lambda(lambda_away, upper=score_lambda_cap)
     rho = 0.0
     score_correlation = score_model.get("score_correlation", {}) if isinstance(score_model, dict) else {}
     if isinstance(score_correlation, dict):
@@ -1727,8 +2160,30 @@ def score_prediction_from_trained_model(
         asian_market_probabilities,
         total_goals_line,
         total_goals_market_probabilities,
+        btts_promotion_weight,
+        high_total_promotion_weight,
+        btts_total_threshold,
+        score_common_result_boost,
+        score_draw_candidate_boost,
+        score_top5_to_top3_btts_boost,
+        score_top5_to_top3_high_total_boost,
+        score_big_margin_tail_boost,
     )
-    top_scores = sorted(grid, key=lambda item: item[2], reverse=True)[:3]
+    ranked_top_scores = sorted(grid, key=lambda item: item[2], reverse=True)
+    top_scores = promote_top5_to_top3(
+        ranked_top_scores,
+        lambda_home,
+        lambda_away,
+        market_home,
+        market_draw,
+        market_away,
+        score_draw_candidate_boost,
+        score_top5_to_top3_btts_boost,
+        score_top5_to_top3_high_total_boost,
+        score_big_margin_tail_boost,
+        score_open_game_top5_gap_ratio,
+        score_open_game_top5_direct_boost,
+    )
     over_25 = sum(prob for home_goals, away_goals, prob in grid if home_goals + away_goals >= 3)
     both_score = sum(prob for home_goals, away_goals, prob in grid if home_goals > 0 and away_goals > 0)
     return {
@@ -1739,6 +2194,18 @@ def score_prediction_from_trained_model(
         "over_25": over_25,
         "both_score": both_score,
         "prematch_adjustments": prematch_meta,
+        "historical_context": historical_context,
+        "score_lambda_settings": {
+            "base_lambda_home": base_lambda_home,
+            "base_lambda_away": base_lambda_away,
+            "historical_lambda_home": historical_lambda_home,
+            "historical_lambda_away": historical_lambda_away,
+            "historical_lambda_mix": historical_lambda_mix,
+            "recent_feature_scale": recent_feature_scale,
+            "rest_feature_scale": rest_feature_scale,
+            "lambda_global_scale": score_lambda_global_scale,
+            "lambda_cap": score_lambda_cap,
+        },
         "market_lambda_adjustments": market_lambda_meta,
         "source": "trained_score_model",
     }
@@ -1872,6 +2339,7 @@ def parse_odds_page(
             match_time = normalize_text(match_time_match.group(1))
 
         prematch = prematch_news_index.get((normalize_text(match_time), normalize_text(home), normalize_text(away)))
+        prematch = enrich_prematch_with_group_motivation(prematch, home, away)
 
         sp_arr_match = re.search(r'class="spArr"[\s\S]*?value="([^"]*)"', block)
         sp_value = html.unescape(sp_arr_match.group(1)) if sp_arr_match else ""
@@ -1934,6 +2402,22 @@ def parse_odds_page(
             asian_market_probabilities=asian_market_for_score,
             total_goals_line=total_goals_line,
             total_goals_market_probabilities=total_goals_market_for_score,
+            score_goal_diff_shrink=float(risk_config.get("score_goal_diff_shrink", 0.0) or 0.0),
+            btts_promotion_weight=float(risk_config.get("score_btts_promotion_weight", 0.0) or 0.0),
+            high_total_promotion_weight=float(risk_config.get("score_high_total_promotion_weight", 0.0) or 0.0),
+            btts_total_threshold=float(risk_config.get("score_btts_total_threshold", 2.55) or 2.55),
+            score_lambda_cap=float(risk_config.get("score_lambda_cap", 4.5) or 4.5),
+            score_lambda_global_scale=float(risk_config.get("score_lambda_global_scale", 1.0) or 1.0),
+            score_recent_feature_scale=float(risk_config.get("score_recent_feature_scale", 0.0) or 0.0),
+            score_rest_feature_scale=float(risk_config.get("score_rest_feature_scale", 0.0) or 0.0),
+            score_historical_lambda_mix=float(risk_config.get("score_historical_lambda_mix", 1.0) or 1.0),
+            score_common_result_boost=float(risk_config.get("score_common_result_boost", 0.0) or 0.0),
+            score_draw_candidate_boost=float(risk_config.get("score_draw_candidate_boost", 0.0) or 0.0),
+            score_top5_to_top3_btts_boost=float(risk_config.get("score_top5_to_top3_btts_boost", 0.0) or 0.0),
+            score_top5_to_top3_high_total_boost=float(risk_config.get("score_top5_to_top3_high_total_boost", 0.0) or 0.0),
+            score_big_margin_tail_boost=float(risk_config.get("score_big_margin_tail_boost", 0.0) or 0.0),
+            score_open_game_top5_gap_ratio=float(risk_config.get("score_open_game_top5_gap_ratio", 0.0) or 0.0),
+            score_open_game_top5_direct_boost=float(risk_config.get("score_open_game_top5_direct_boost", 0.0) or 0.0),
         )
         score_prediction = trained_prediction or (
             score_prediction_from_wdl(
@@ -1944,6 +2428,17 @@ def parse_odds_page(
                 asian_market_for_score,
                 total_goals_line,
                 total_goals_market_for_score,
+                float(risk_config.get("score_goal_diff_shrink", 0.0) or 0.0),
+                float(risk_config.get("score_btts_promotion_weight", 0.0) or 0.0),
+                float(risk_config.get("score_high_total_promotion_weight", 0.0) or 0.0),
+                float(risk_config.get("score_btts_total_threshold", 2.55) or 2.55),
+                float(risk_config.get("score_common_result_boost", 0.0) or 0.0),
+                float(risk_config.get("score_draw_candidate_boost", 0.0) or 0.0),
+                float(risk_config.get("score_top5_to_top3_btts_boost", 0.0) or 0.0),
+                float(risk_config.get("score_top5_to_top3_high_total_boost", 0.0) or 0.0),
+                float(risk_config.get("score_big_margin_tail_boost", 0.0) or 0.0),
+                float(risk_config.get("score_open_game_top5_gap_ratio", 0.0) or 0.0),
+                float(risk_config.get("score_open_game_top5_direct_boost", 0.0) or 0.0),
             )
             if probs
             else None
@@ -2026,6 +2521,13 @@ def parse_odds_page(
                 "kelly_stakes": kelly_stakes,
                 "score_prediction": score_prediction,
                 "monte_carlo": monte_carlo,
+                "prediction_rule_config": {
+                    "draw_pick_override_enabled": float(risk_config.get("draw_pick_override_enabled", 0.0) or 0.0) > 0,
+                    "draw_pick_min_probability": float(risk_config.get("draw_pick_min_probability", 0.26) or 0.26),
+                    "draw_pick_max_gap_to_favorite": float(risk_config.get("draw_pick_max_gap_to_favorite", 0.15) or 0.15),
+                    "draw_pick_favorite_max_probability": float(risk_config.get("draw_pick_favorite_max_probability", 0.50) or 0.50),
+                    "high_confidence_margin_threshold": float(risk_config.get("high_confidence_margin_threshold", 0.30) or 0.30),
+                },
             }
         )
     return sorted(rows, key=lambda r: (r["match_time"], r["num"]))
@@ -2075,6 +2577,7 @@ def fetch_qtx_future_matches(
                 probs = calibrate_wdl_probabilities(probs, risk_config)
                 match_time = f"2026-{parts[1]}"
                 prematch = prematch_news_index.get((normalize_text(match_time), normalize_text(home), normalize_text(away)))
+                prematch = enrich_prematch_with_group_motivation(prematch, home, away)
                 normal_odds = [0.0, 0.0, 0.0]
                 handicap_odds = [0.0, 0.0, 0.0]
                 asian_handicap_line = None
@@ -2096,8 +2599,37 @@ def fetch_qtx_future_matches(
                     fallback_probabilities=probs,
                     strengths=strengths,
                     prematch_news_index=prematch_news_index,
+                    score_goal_diff_shrink=float(risk_config.get("score_goal_diff_shrink", 0.0) or 0.0),
+                    btts_promotion_weight=float(risk_config.get("score_btts_promotion_weight", 0.0) or 0.0),
+                    high_total_promotion_weight=float(risk_config.get("score_high_total_promotion_weight", 0.0) or 0.0),
+                    btts_total_threshold=float(risk_config.get("score_btts_total_threshold", 2.55) or 2.55),
+                    score_lambda_cap=float(risk_config.get("score_lambda_cap", 4.5) or 4.5),
+                    score_lambda_global_scale=float(risk_config.get("score_lambda_global_scale", 1.0) or 1.0),
+                    score_recent_feature_scale=float(risk_config.get("score_recent_feature_scale", 0.0) or 0.0),
+                    score_rest_feature_scale=float(risk_config.get("score_rest_feature_scale", 0.0) or 0.0),
+                    score_historical_lambda_mix=float(risk_config.get("score_historical_lambda_mix", 1.0) or 1.0),
+                    score_common_result_boost=float(risk_config.get("score_common_result_boost", 0.0) or 0.0),
+                    score_draw_candidate_boost=float(risk_config.get("score_draw_candidate_boost", 0.0) or 0.0),
+                    score_top5_to_top3_btts_boost=float(risk_config.get("score_top5_to_top3_btts_boost", 0.0) or 0.0),
+                    score_top5_to_top3_high_total_boost=float(risk_config.get("score_top5_to_top3_high_total_boost", 0.0) or 0.0),
+                    score_big_margin_tail_boost=float(risk_config.get("score_big_margin_tail_boost", 0.0) or 0.0),
+                    score_open_game_top5_gap_ratio=float(risk_config.get("score_open_game_top5_gap_ratio", 0.0) or 0.0),
+                    score_open_game_top5_direct_boost=float(risk_config.get("score_open_game_top5_direct_boost", 0.0) or 0.0),
                 )
-                score_prediction = trained_prediction or (score_prediction_from_wdl(probs) if probs else None)
+                score_prediction = trained_prediction or (score_prediction_from_wdl(
+                    probs,
+                    score_goal_diff_shrink=float(risk_config.get("score_goal_diff_shrink", 0.0) or 0.0),
+                    btts_promotion_weight=float(risk_config.get("score_btts_promotion_weight", 0.0) or 0.0),
+                    high_total_promotion_weight=float(risk_config.get("score_high_total_promotion_weight", 0.0) or 0.0),
+                    btts_total_threshold=float(risk_config.get("score_btts_total_threshold", 2.55) or 2.55),
+                    common_result_boost=float(risk_config.get("score_common_result_boost", 0.0) or 0.0),
+                    draw_candidate_boost=float(risk_config.get("score_draw_candidate_boost", 0.0) or 0.0),
+                    top5_to_top3_btts_boost=float(risk_config.get("score_top5_to_top3_btts_boost", 0.0) or 0.0),
+                    top5_to_top3_high_total_boost=float(risk_config.get("score_top5_to_top3_high_total_boost", 0.0) or 0.0),
+                    big_margin_tail_boost=float(risk_config.get("score_big_margin_tail_boost", 0.0) or 0.0),
+                    open_game_top5_gap_ratio=float(risk_config.get("score_open_game_top5_gap_ratio", 0.0) or 0.0),
+                    open_game_top5_direct_boost=float(risk_config.get("score_open_game_top5_direct_boost", 0.0) or 0.0),
+                ) if probs else None)
                 monte_carlo = None
                 if risk_config.get("enable_monte_carlo", 1.0) > 0:
                     monte_carlo = monte_carlo_validate_score_prediction(score_prediction, risk_config, target_probabilities=probs, market_probabilities=market_probs)
@@ -2163,6 +2695,13 @@ def fetch_qtx_future_matches(
                         "kelly_stakes": kelly_stakes,
                         "score_prediction": score_prediction,
                         "monte_carlo": monte_carlo,
+                        "prediction_rule_config": {
+                            "draw_pick_override_enabled": float(risk_config.get("draw_pick_override_enabled", 0.0) or 0.0) > 0,
+                            "draw_pick_min_probability": float(risk_config.get("draw_pick_min_probability", 0.26) or 0.26),
+                            "draw_pick_max_gap_to_favorite": float(risk_config.get("draw_pick_max_gap_to_favorite", 0.15) or 0.15),
+                            "draw_pick_favorite_max_probability": float(risk_config.get("draw_pick_favorite_max_probability", 0.50) or 0.50),
+                            "high_confidence_margin_threshold": float(risk_config.get("high_confidence_margin_threshold", 0.30) or 0.30),
+                        },
                     }
                 )
             except Exception:
@@ -2469,13 +3008,22 @@ def select_ticket(rows: List[dict], risk_config: Optional[Dict[str, float]] = No
 def predicted_outcome(row: dict) -> Tuple[int, float, float]:
     probabilities = row_probabilities(row) or row.get("probabilities") or (0.0, 0.0, 0.0)
     best_idx = max(range(3), key=lambda idx: probabilities[idx])
+    prediction_rules = row.get("prediction_rule_config") or {}
+    if prediction_rules.get("draw_pick_override_enabled") and len(probabilities) >= 3:
+        home, draw, away = probabilities[:3]
+        favorite = max(home, away)
+        draw_threshold = float(prediction_rules.get("draw_pick_min_probability", 0.26) or 0.26)
+        draw_delta = float(prediction_rules.get("draw_pick_max_gap_to_favorite", 0.15) or 0.15)
+        favorite_max = float(prediction_rules.get("draw_pick_favorite_max_probability", 0.50) or 0.50)
+        if draw >= draw_threshold and draw >= favorite - draw_delta and favorite <= favorite_max:
+            best_idx = 1
     sorted_probs = sorted(probabilities, reverse=True)
     margin = sorted_probs[0] - sorted_probs[1] if len(sorted_probs) >= 2 else sorted_probs[0]
     return best_idx, probabilities[best_idx], margin
 
 
-def confidence_text(probability: float, margin: float) -> str:
-    if probability >= 0.62 and margin >= 0.18:
+def confidence_text(probability: float, margin: float, high_confidence_margin_threshold: float = 0.18) -> str:
+    if probability >= 0.62 and margin >= high_confidence_margin_threshold:
         return "高"
     if probability >= 0.50 and margin >= 0.10:
         return "中高"
@@ -2497,7 +3045,9 @@ def goal_trend_text(prediction: Optional[dict]) -> str:
 
 def result_pick_text(row: dict) -> str:
     idx, probability, margin = predicted_outcome(row)
-    return f"{OUTCOME_NAMES[idx]} {pct(probability, 1)}（信心{confidence_text(probability, margin)}）"
+    prediction_rules = row.get("prediction_rule_config") or {}
+    high_confidence_margin_threshold = float(prediction_rules.get("high_confidence_margin_threshold", 0.18) or 0.18)
+    return f"{OUTCOME_NAMES[idx]} {pct(probability, 1)}（信心{confidence_text(probability, margin, high_confidence_margin_threshold)}）"
 
 
 def result_reason_text(row: dict) -> str:
@@ -2534,6 +3084,110 @@ def ai_adjustment_summary(row: dict) -> str:
     tactical_text = f"；{tactical}" if tactical else ""
     weather_text = f"；天气：{weather}" if weather else ""
     return f"{delta_text}；置信度 {confidence}；{reason_text}{tactical_text}{weather_text}"
+
+
+def short_text(value: object, limit: int = 60) -> str:
+    text = normalize_text(str(value or ""))
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "..."
+
+
+def chip_html(label: str, tone: str = "info") -> str:
+    return f'<span class="chip {tone}">{html.escape(label)}</span>'
+
+
+def decision_text(row: dict) -> str:
+    odds = row.get("normal_odds") or []
+    kelly_fractions = row.get("kelly_fractions") or [0.0, 0.0, 0.0]
+    kelly_stakes = row.get("kelly_stakes") or [0.0, 0.0, 0.0]
+    ev = row.get("ev") or [None, None, None]
+    if all(float(value or 0.0) <= 0 for value in odds):
+        return "仅赛果参考：普通胜平负未开，暂不做投注建议。"
+    best_idx = max(range(3), key=lambda idx: (kelly_fractions[idx] if idx < len(kelly_fractions) else 0.0, ev[idx] if idx < len(ev) and ev[idx] is not None else -999))
+    if best_idx < len(kelly_stakes) and kelly_stakes[best_idx] > 0:
+        return f"可关注 {OUTCOME_NAMES[best_idx]}：EV {ev_text(ev[best_idx])}，建议 {kelly_stakes[best_idx]:.1f} 元。"
+    best_ev = ev[best_idx] if best_idx < len(ev) else None
+    if best_ev is not None and best_ev > -0.02:
+        return f"接近保本但未达 Kelly 门槛：{OUTCOME_NAMES[best_idx]} {ev_text(best_ev)}，建议观望。"
+    return "建议观望：当前赔率与模型边际不足。"
+
+
+def factor_chips_html(row: dict) -> str:
+    prediction = row.get("score_prediction") or {}
+    prematch = prediction.get("prematch_adjustments") or {}
+    historical = prediction.get("historical_context") or {}
+    chips: List[str] = []
+    if historical:
+        home_for = historical.get("home_last5_goals_for", 0)
+        home_against = historical.get("home_last5_goals_against", 0)
+        away_for = historical.get("away_last5_goals_for", 0)
+        away_against = historical.get("away_last5_goals_against", 0)
+        chips.append(chip_html(f"近况 {row['home']} {home_for}/{home_against}，{row['away']} {away_for}/{away_against}", "info"))
+        chips.append(chip_html(f"休息 {historical.get('home_rest_days', 0)}天 / {historical.get('away_rest_days', 0)}天", "info"))
+    group_summary = prematch.get("group_motivation_summary", "")
+    if group_summary:
+        chips.append(chip_html(f"战意 {short_text(group_summary, 34)}", "warn"))
+    weather_summary = prematch.get("weather_summary", "")
+    if weather_summary:
+        chips.append(chip_html(f"天气 {short_text(weather_summary, 34)}", "info"))
+    injury_home = prematch.get("home_injury_count", 0)
+    injury_away = prematch.get("away_injury_count", 0)
+    suspension_home = prematch.get("home_suspension_count", 0)
+    suspension_away = prematch.get("away_suspension_count", 0)
+    if any(float(value or 0.0) > 0 for value in (injury_home, injury_away, suspension_home, suspension_away)):
+        chips.append(chip_html(f"伤停 {injury_home}+{suspension_home} / {injury_away}+{suspension_away}", "warn"))
+    return "".join(chips) or chip_html("暂无额外因子", "muted-chip")
+
+
+def risk_chips_html(row: dict) -> str:
+    prediction = row.get("score_prediction") or {}
+    prematch = prediction.get("prematch_adjustments") or {}
+    historical = prediction.get("historical_context") or {}
+    chips: List[str] = []
+    if all(float(value or 0.0) <= 0 for value in (row.get("normal_odds") or [])):
+        chips.append(chip_html("赔率未开", "danger"))
+    lambda_home = float(prediction.get("lambda_home", 0.0) or 0.0)
+    lambda_away = float(prediction.get("lambda_away", 0.0) or 0.0)
+    if lambda_home >= 4.45 or lambda_away >= 4.45:
+        chips.append(chip_html("比分模型偏大", "danger"))
+    if float(historical.get("home_recent_match_count", 0.0) or 0.0) < 2 or float(historical.get("away_recent_match_count", 0.0) or 0.0) < 2:
+        chips.append(chip_html("近期样本少", "warn"))
+    weather_source = str(prematch.get("weather_source", ""))
+    if weather_source in {"missing_venue", "missing_venue_mapping", ""} and not prematch.get("weather_summary"):
+        chips.append(chip_html("天气待补", "warn"))
+    if prematch.get("group_motivation"):
+        chips.append(chip_html("战意自动推导", "warn"))
+    return "".join(chips) or chip_html("常规风险", "ok")
+
+
+def match_card_html(row: dict) -> str:
+    prediction = row.get("score_prediction") or {}
+    lambda_home = float(prediction.get("lambda_home", 0.0) or 0.0)
+    lambda_away = float(prediction.get("lambda_away", 0.0) or 0.0)
+    stage_label = str(row.get("stage") or row.get("round") or "世界杯比赛日")
+    featured = bool(row.get("featured_focus"))
+    featured_badge = '<span class="focus-badge">焦点战</span>' if featured else ""
+    return f"""
+<article class="match-card{' featured-match' if featured else ''}">
+  <div class="match-topline"><span>{html.escape(stage_label)}</span><span>{html.escape(row.get('num', ''))}</span></div>
+  {featured_badge}
+  <div class="scoreboard-header">
+    <div class="team-panel home"><span class="team-role">主队</span><b>{html.escape(row['home'])}</b></div>
+    <div class="score-core"><span class="kickoff-badge">{html.escape(row['match_time'])}</span><strong>VS</strong><small>{html.escape(result_pick_text(row))}</small></div>
+    <div class="team-panel away"><span class="team-role">客队</span><b>{html.escape(row['away'])}</b></div>
+  </div>
+  <div class="prediction-strip">
+    <div><b>{html.escape(result_pick_text(row))}</b><small>赛果方向</small></div>
+    <div><b>{html.escape(score_prediction_text(prediction))}</b><small>比分 Top3</small></div>
+    <div><b>{html.escape(goal_trend_text(prediction))}</b><small>进球倾向</small></div>
+  </div>
+  <p class="decision">{html.escape(decision_text(row))}</p>
+  <div class="card-section"><span class="section-label">关键因子</span><div class="chips">{factor_chips_html(row)}</div></div>
+  <div class="card-section"><span class="section-label">风险提示</span><div class="chips">{risk_chips_html(row)}</div></div>
+  <p class="muted small">λ：{lambda_home:.2f} / {lambda_away:.2f}；{html.escape(result_reason_text(row))}</p>
+</article>
+"""
 
 
 def ticket_metrics(picks: List[Tuple[dict, int]], stake_per_pick: float = 2.0) -> Tuple[float, float, float, float]:
@@ -2655,8 +3309,14 @@ def generate_report(
     stake, expected_return, roi, profit_probability, stake_details = ticket_metrics_with_stakes(picks)
     modeled_rows = [row for row in rows if row["probabilities"]]
     display_rows = prioritize_primary_rows(rows)
+    best_confidence_row = max(display_rows, key=lambda item: predicted_outcome(item)[1], default=None)
+    for item in display_rows:
+        item["featured_focus"] = bool(best_confidence_row) and item is best_confidence_row
+    high_risk_count = sum(1 for row in display_rows if "danger" in risk_chips_html(row))
+    positive_ticket_count = len(picks)
 
     focus = display_rows[:2]
+    match_cards = "\n".join(match_card_html(row) for row in display_rows) or '<p class="muted">暂无可展示比赛。</p>'
     focus_rows = "\n".join(
         "<tr>"
         f"<td>{html.escape(row['match_time'])}</td>"
@@ -2736,6 +3396,11 @@ def generate_report(
     ]
     no_normal_text = "、".join(no_normal) if no_normal else "无"
     kelly_label = kelly_fraction_text(risk_config.get("kelly_fraction", 0.25))
+    best_confidence_text = (
+        f"{best_confidence_row['home']} vs {best_confidence_row['away']} · {result_pick_text(best_confidence_row)}"
+        if best_confidence_row
+        else "暂无"
+    )
     module_rows: List[str] = []
     module_specs = [
         ("weather", "天气修正", "weather_model_accuracy", "weather_model_brier", "weather_model_logloss", "weather_adjustment_decision"),
@@ -2761,74 +3426,321 @@ def generate_report(
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>世界杯每日赛果预测报告</title>
 <style>
-body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; line-height: 1.55; color: #172033; background: #f6f8fb; margin: 0; padding: 24px; }}
-main {{ max-width: 1180px; margin: 0 auto; background: #fff; padding: 28px; border: 1px solid #d9e1ec; }}
-h1 {{ margin: 0 0 8px; font-size: 28px; }}
-h2 {{ margin: 24px 0 10px; font-size: 19px; }}
-table {{ width: 100%; border-collapse: collapse; margin: 10px 0 16px; font-size: 13px; }}
-th, td {{ border: 1px solid #dfe6ef; padding: 8px; vertical-align: top; }}
-th {{ background: #eef3f8; text-align: left; }}
-.stamp, .muted {{ color: #617086; }}
-.notice {{ background: #fff8df; border-left: 4px solid #d99a00; padding: 10px 12px; }}
-.ticket {{ background: #f2fff7; border-left: 4px solid #1b9c66; padding: 10px 12px; }}
-.pos {{ color: #087f4f; font-weight: 700; }}
-.near {{ color: #9a6500; font-weight: 700; }}
-.neg {{ color: #8a2432; }}
+:root {{
+  --ink:#f6f4ee;
+  --ink-soft:#d2d9d3;
+  --pitch:#0f5c46;
+  --pitch-deep:#09392d;
+  --midnight:#081726;
+  --gold:#d6b15f;
+  --gold-soft:#f4dfac;
+  --red:#c74343;
+  --blue:#56a5df;
+  --mint:#7fd2a6;
+  --card-line:rgba(236,245,240,.16);
+  --panel:rgba(7,19,33,.74);
+  --panel-soft:rgba(8,33,55,.58);
+}}
+body {{
+  font-family: "Aptos", "Segoe UI", "Microsoft YaHei", sans-serif;
+  line-height: 1.55;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at top left, rgba(214,177,95,.22), transparent 24%),
+    radial-gradient(circle at 88% 12%, rgba(86,165,223,.18), transparent 24%),
+    linear-gradient(180deg, #0a2132 0%, #06111b 22%, #08241d 58%, #051018 100%);
+  margin: 0;
+  padding: 24px;
+}}
+main {{
+  max-width: 1220px;
+  margin: 0 auto;
+  background:
+    linear-gradient(180deg, rgba(8,23,38,.94) 0%, rgba(7,23,34,.92) 32%, rgba(6,25,21,.92) 100%);
+  padding: 28px;
+  border: 1px solid rgba(214,177,95,.18);
+  box-shadow: 0 24px 80px rgba(0,0,0,.42);
+  position: relative;
+  overflow: hidden;
+}}
+main::before {{
+  content:"";
+  position:absolute;
+  inset:0;
+  background:
+    radial-gradient(circle at 16% 8%, rgba(255,255,255,.08), transparent 15%),
+    radial-gradient(circle at 84% 18%, rgba(255,255,255,.06), transparent 17%),
+    linear-gradient(90deg, transparent 0%, rgba(255,255,255,.04) 48%, transparent 52%, transparent 100%);
+  pointer-events:none;
+}}
+h1 {{ margin: 0 0 8px; font-size: 34px; letter-spacing: -.03em; color: var(--ink); }}
+h2 {{ margin: 30px 0 12px; font-size: 20px; color: var(--gold-soft); }}
+h3 {{ margin: 8px 0 14px; font-size: 21px; color: var(--ink); }}
+table {{ width: 100%; border-collapse: collapse; margin: 10px 0 16px; font-size: 13px; background: rgba(4,12,20,.44); }}
+th, td {{ border: 1px solid rgba(214,177,95,.12); padding: 8px; vertical-align: top; color: var(--ink); }}
+th {{ background: rgba(214,177,95,.12); text-align: left; color: var(--gold-soft); }}
+.stamp, .muted {{ color: var(--ink-soft); }}
+.small {{ font-size: 12px; }}
+.tournament-banner {{
+  position: relative;
+  padding: 22px 24px 24px;
+  border: 1px solid rgba(214,177,95,.24);
+  background:
+    linear-gradient(135deg, rgba(6,23,37,.95) 0%, rgba(11,67,55,.92) 52%, rgba(20,42,68,.95) 100%);
+  border-radius: 28px;
+  margin-bottom: 22px;
+  overflow: hidden;
+}}
+.tournament-banner::before {{
+  content:"";
+  position:absolute;
+  inset:0;
+  background:
+    radial-gradient(circle at 10% 10%, rgba(214,177,95,.32), transparent 20%),
+    radial-gradient(circle at 88% 18%, rgba(255,255,255,.12), transparent 18%),
+    linear-gradient(0deg, transparent 0%, rgba(255,255,255,.05) 49.5%, transparent 50.5%, transparent 100%);
+  pointer-events:none;
+}}
+.tournament-strip {{
+  display:inline-flex;
+  align-items:center;
+  gap:10px;
+  padding:6px 12px;
+  border-radius:999px;
+  background:rgba(214,177,95,.14);
+  color:var(--gold-soft);
+  border:1px solid rgba(214,177,95,.25);
+  font-size:12px;
+  text-transform:uppercase;
+  letter-spacing:.14em;
+}}
+.crest-dot {{ width:10px; height:10px; border-radius:50%; background:var(--gold); box-shadow:0 0 0 6px rgba(214,177,95,.14); }}
+.banner-grid {{ display:grid; grid-template-columns: minmax(0, 1.4fr) minmax(280px, .8fr); gap:18px; align-items:end; margin-top:18px; position:relative; z-index:1; }}
+.banner-copy p {{ margin: 0 0 8px; max-width: 720px; color: var(--ink-soft); }}
+.banner-meta {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }}
+.meta-pill {{ padding:7px 12px; border-radius:999px; background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.08); color:var(--ink); font-size:12px; }}
+.banner-scoreboard {{
+  display:grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap:12px;
+  background: rgba(6,18,31,.52);
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 22px;
+  padding: 16px;
+}}
+.scoreboard-box {{ background: rgba(255,255,255,.04); border-radius: 16px; padding: 12px 14px; border: 1px solid rgba(255,255,255,.06); }}
+.scoreboard-box b {{ display:block; font-size: 22px; color: var(--gold-soft); }}
+.notice {{ background: rgba(214,177,95,.14); border-left: 4px solid var(--gold); padding: 10px 12px; color: var(--ink); }}
+.ticket {{ background: rgba(127,210,166,.14); border-left: 4px solid var(--mint); padding: 10px 12px; }}
+.hero-grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 18px 0; }}
+.metric-card {{
+  background: linear-gradient(180deg, rgba(255,255,255,.08) 0%, rgba(255,255,255,.03) 100%);
+  border: 1px solid rgba(255,255,255,.07);
+  border-radius: 18px;
+  padding: 16px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.08);
+}}
+.metric-card b {{ display:block; font-size: 24px; margin-bottom: 4px; color: var(--gold-soft); }}
+.metric-card span {{ color: var(--ink-soft); }}
+.match-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }}
+.match-card {{
+  background:
+    linear-gradient(180deg, rgba(8,22,33,.9) 0%, rgba(9,63,47,.88) 100%);
+  border: 1px solid rgba(127,210,166,.18);
+  border-radius: 22px;
+  padding: 18px;
+  box-shadow: 0 10px 32px rgba(0,0,0,.22);
+  position: relative;
+  overflow: hidden;
+}}
+.featured-match {{
+  border: 1px solid rgba(214,177,95,.45);
+  box-shadow: 0 16px 42px rgba(0,0,0,.28), 0 0 0 1px rgba(214,177,95,.22);
+}}
+.match-card::before {{
+  content:"";
+  position:absolute;
+  inset:-1px;
+  background:
+    linear-gradient(90deg, transparent 0%, rgba(255,255,255,.05) 49.5%, transparent 50.5%, transparent 100%),
+    linear-gradient(0deg, transparent 0%, rgba(255,255,255,.04) 49.5%, transparent 50.5%, transparent 100%);
+  opacity:.45;
+  pointer-events:none;
+}}
+.featured-match::after {{
+  content:"";
+  position:absolute;
+  inset:0;
+  background: linear-gradient(135deg, rgba(214,177,95,.16) 0%, transparent 38%, transparent 100%);
+  pointer-events:none;
+}}
+.match-topline {{ display:flex; justify-content:space-between; gap:12px; color:var(--ink-soft); font-size:12px; position:relative; z-index:1; }}
+.focus-badge {{
+  position:absolute;
+  top:14px;
+  right:14px;
+  z-index:2;
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:6px 12px;
+  border-radius:999px;
+  background: linear-gradient(90deg, rgba(214,177,95,.95) 0%, rgba(244,223,172,.9) 100%);
+  color:#37260b;
+  font-size:12px;
+  font-weight:700;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+  box-shadow: 0 8px 24px rgba(214,177,95,.22);
+}}
+.focus-badge::before {{ content:"🏆"; font-size:13px; }}
+.scoreboard-header {{
+  display:grid;
+  grid-template-columns: minmax(0, 1fr) 150px minmax(0, 1fr);
+  gap:12px;
+  align-items:center;
+  margin: 10px 0 14px;
+  position:relative;
+  z-index:1;
+}}
+.team-panel {{
+  min-height: 96px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: rgba(255,255,255,.07);
+  border: 1px solid rgba(255,255,255,.08);
+  display:flex;
+  flex-direction:column;
+  justify-content:center;
+  gap:6px;
+}}
+.team-panel.home {{ box-shadow: inset 0 0 0 1px rgba(127,210,166,.12); }}
+.team-panel.away {{ box-shadow: inset 0 0 0 1px rgba(86,165,223,.12); text-align:right; }}
+.team-role {{ font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-soft); }}
+.team-panel b {{ font-size: 24px; line-height: 1.1; color: var(--ink); }}
+.score-core {{
+  text-align:center;
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  align-items:center;
+  justify-content:center;
+}}
+.kickoff-badge {{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  padding:6px 10px;
+  border-radius:999px;
+  font-size:11px;
+  color: var(--gold-soft);
+  background: rgba(214,177,95,.14);
+  border: 1px solid rgba(214,177,95,.24);
+}}
+.score-core strong {{ font-size: 32px; letter-spacing: .08em; color: var(--gold-soft); }}
+.score-core small {{ color: var(--ink-soft); font-size: 12px; max-width: 130px; }}
+.match-card h3 span {{ color: var(--gold); font-weight: 500; }}
+.prediction-strip {{ display:grid; grid-template-columns: 1fr; gap:8px; position:relative; z-index:1; }}
+.prediction-strip div {{ background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:11px; }}
+.prediction-strip b {{ display:block; color: var(--ink); }}
+.prediction-strip small, .section-label {{ color:var(--ink-soft); font-size:12px; }}
+.decision {{ border-left:4px solid var(--gold); background:rgba(214,177,95,.12); padding:10px 12px; font-weight:700; position:relative; z-index:1; }}
+.card-section {{ margin-top:10px; position:relative; z-index:1; }}
+.chips {{ display:flex; flex-wrap:wrap; gap:6px; margin-top:5px; }}
+.chip {{ display:inline-flex; align-items:center; border-radius:999px; padding:4px 9px; font-size:12px; border:1px solid transparent; }}
+.chip.info {{ color:#dff3ff; background:rgba(86,165,223,.18); border-color:rgba(86,165,223,.28); }}
+.chip.ok {{ color:#dcffe9; background:rgba(127,210,166,.18); border-color:rgba(127,210,166,.3); }}
+.chip.warn {{ color:#fff1c9; background:rgba(214,177,95,.18); border-color:rgba(214,177,95,.3); }}
+.chip.danger {{ color:#ffd5d5; background:rgba(199,67,67,.18); border-color:rgba(199,67,67,.3); }}
+.chip.muted-chip {{ color:var(--ink-soft); background:rgba(255,255,255,.06); border-color:rgba(255,255,255,.08); }}
+.details-block {{ overflow-x:auto; }}
+.pos {{ color: #9df5c2; font-weight: 700; }}
+.near {{ color: #f7dd92; font-weight: 700; }}
+.neg {{ color: #ffb7b7; }}
+ul {{ color: var(--ink-soft); }}
+@media (max-width: 980px) {{ .banner-grid {{ grid-template-columns: 1fr; }} .hero-grid, .match-grid {{ grid-template-columns: 1fr; }} .scoreboard-header {{ grid-template-columns: 1fr; }} .team-panel.away {{ text-align:left; }} .score-core {{ order:-1; }} .team-panel {{ min-height: auto; }} }}
+@media (max-width: 820px) {{ body {{ padding: 10px; }} main {{ padding: 16px; }} table {{ font-size: 12px; }} .tournament-banner {{ padding: 16px; border-radius: 20px; }} h1 {{ font-size: 28px; }} }}
 </style>
 </head>
 <body>
 <main>
-<h1>世界杯每日赛果预测报告</h1>
-<p class="stamp">生成时间：{generated_at.strftime("%Y-%m-%d %H:%M:%S")}（本机时间）</p>
+<section class="tournament-banner">
+  <div class="tournament-strip"><span class="crest-dot"></span>FIFA WORLD CUP 2026 MATCHDAY BRIEF</div>
+  <div class="banner-grid">
+    <div class="banner-copy">
+      <h1>世界杯每日赛果预测报告</h1>
+      <p class="stamp">生成时间：{generated_at.strftime("%Y-%m-%d %H:%M:%S")}（本机时间）</p>
+      <p>围绕赛果方向、比分 Top3、总进球倾向和风险标签，形成一页式比赛简报。重点强调淘汰赛氛围、临场战意与赔率分歧，不把报告做成普通后台表格。</p>
+      <div class="banner-meta">
+        <span class="meta-pill">FIFA 2026</span>
+        <span class="meta-pill">赛前简报</span>
+        <span class="meta-pill">概率 + 比分 + 风险</span>
+      </div>
+    </div>
+    <div class="banner-scoreboard">
+      <div class="scoreboard-box"><b>{len(display_rows)}</b><span class="muted">今日焦点场次</span></div>
+      <div class="scoreboard-box"><b>{len(modeled_rows)}</b><span class="muted">模型覆盖比赛</span></div>
+      <div class="scoreboard-box"><b>{positive_ticket_count}</b><span class="muted">正 EV 机会</span></div>
+      <div class="scoreboard-box"><b>{high_risk_count}</b><span class="muted">高风险提醒</span></div>
+    </div>
+  </div>
+</section>
 <p class="notice">本报告优先服务于比赛结果预测，赔率、EV 和 Kelly 仅作为辅助参考；所有概率不是保证命中，也不是官方建议。</p>
 
 <section id="summary">
 <h2>本轮摘要</h2>
 <p>当前抓取到可售世界杯场次 {len(rows)} 场，其中模型已覆盖 {len(modeled_rows)} 场。普通胜平负未开场次：{html.escape(no_normal_text)}。</p>
-</section>
-
-<section id="module-review">
-<h2>最近一次复盘模块效果</h2>
-<p class="muted">数据来自 `config/bayesian_calibration.json` 中最近一次复盘校准结果，用于观察天气、战术、身价修正的独立表现。</p>
-<table><thead><tr><th>模块</th><th>准确率</th><th>Brier</th><th>logloss</th><th>调优结论</th></tr></thead><tbody>
-{module_review_rows}
-</tbody></table>
+<div class="hero-grid">
+  <div class="metric-card"><b>{len(display_rows)}</b><span class="muted">待看比赛</span></div>
+  <div class="metric-card"><b>{len(modeled_rows)}</b><span class="muted">模型覆盖</span></div>
+  <div class="metric-card"><b>{positive_ticket_count}</b><span class="muted">Kelly 可下注项</span></div>
+  <div class="metric-card"><b>{high_risk_count}</b><span class="muted">高风险标签场次</span></div>
+</div>
+<p class="notice"><b>最高信心：</b>{html.escape(best_confidence_text)}。投注层面优先看 EV/Kelly；普通赔率未开时仅作赛果方向参考。</p>
 </section>
 
 <section id="matches-24h">
-<h2>今日/未来 24 小时重点预测</h2>
-<table><thead><tr><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>最可能比分</th><th>进球倾向</th><th>赔率变化</th></tr></thead><tbody>
-{focus_rows}
-</tbody></table>
+<h2>今日/未来 24 小时比赛卡片</h2>
+<div class="match-grid">
+{match_cards}
+</div>
 </section>
 
 <section id="result-predictions">
 <h2>赛果预测总览</h2>
+<div class="details-block">
 <table><thead><tr><th>编号</th><th>开赛时间</th><th>场次</th><th>预测赛果</th><th>比分 Top3</th><th>进球倾向</th><th>赔率变化</th></tr></thead><tbody>
 {result_rows}
 </tbody></table>
+</div>
 </section>
 
 <section id="remaining-probabilities">
 <h2>赔率与概率明细</h2>
+<div class="details-block">
 <table><thead><tr><th>比赛编号</th><th>开赛时间</th><th>场次</th><th>最可能比分</th><th>当前不让球赔率（主胜/平/客胜）</th><th>赔率变化</th><th>让球赔率（胜/平/负）</th><th>EV（主胜/平/客胜）</th><th>Kelly%</th><th>备注</th></tr></thead><tbody>
 {''.join(row_html(row) for row in display_rows)}
 </tbody></table>
+</div>
 </section>
 
 <section id="handicap-board">
 <h2>辅助：让球胜平负筛选</h2>
+<div class="details-block">
 <table><thead><tr><th>编号</th><th>场次</th><th>让球</th><th>让球融合概率</th><th>让球赔率</th><th>让球 EV</th><th>让球 Kelly%</th></tr></thead><tbody>
 {handicap_rows}
 </tbody></table>
+</div>
 </section>
 
 <section id="ev-board">
 <h2>辅助：赔率与 EV 筛选</h2>
 <p>EV = 融合概率 × 当前赔率 - 1；Kelly% 使用 {kelly_label}，并受单注与总投入上限约束。</p>
+<div class="details-block">
 <table><thead><tr><th>编号</th><th>场次</th><th>选项</th><th>模型概率</th><th>融合概率</th><th>赔率</th><th>保本赔率</th><th>EV</th><th>Kelly%</th></tr></thead><tbody>
 {candidate_rows or '<tr><td colspan="9">当前没有正 EV 或接近正 EV 的普通胜平负选项。</td></tr>'}
 </tbody></table>
+</div>
 </section>
 
 <section id="ticket">
@@ -2836,9 +3748,21 @@ th {{ background: #eef3f8; text-align: left; }}
 <div class="ticket">
 <p><b>主建议：单关/分散买，少串关。</b> Kelly 资金分配策略（{kelly_label}，资金量 {risk_config.get('bankroll', 10.0):.0f} 元）：共 {len(picks)} 注，合计 {stake:.2f} 元；融合概率期望返还约 {expected_return:.2f} 元，ROI 约 {roi * 100:.1f}%；整组最终赚钱概率约 {profit_probability * 100:.1f}%。</p>
 </div>
+<div class="details-block">
 <table><thead><tr><th>编号</th><th>场次</th><th>购买选项</th><th>融合概率</th><th>赔率</th><th>EV</th><th>Kelly%</th><th>建议投注额</th></tr></thead><tbody>
 {ticket_rows}
 </tbody></table>
+</div>
+</section>
+
+<section id="module-review">
+<h2>最近一次复盘模块效果</h2>
+<p class="muted">数据来自 `config/bayesian_calibration.json` 中最近一次复盘校准结果，用于观察天气、战术、身价修正的独立表现。</p>
+<div class="details-block">
+<table><thead><tr><th>模块</th><th>准确率</th><th>Brier</th><th>logloss</th><th>调优结论</th></tr></thead><tbody>
+{module_review_rows}
+</tbody></table>
+</div>
 </section>
 
 <section id="changes">
@@ -3127,6 +4051,8 @@ def serialize_rows(rows: List[dict], generated_at: dt.datetime, odds_url: str) -
                     "over_25": prediction.get("over_25"),
                     "both_score": prediction.get("both_score"),
                     "prematch_adjustments": prediction.get("prematch_adjustments"),
+                    "historical_context": prediction.get("historical_context"),
+                    "score_lambda_settings": prediction.get("score_lambda_settings"),
                     "monte_carlo": prediction.get("monte_carlo") or row.get("monte_carlo"),
                     "source": prediction.get("source"),
                 }
@@ -3146,6 +4072,8 @@ def serialize_training_candidates(rows: List[dict], generated_at: dt.datetime) -
     for row in rows:
         prediction = row.get("score_prediction") or {}
         prematch = prediction.get("prematch_adjustments") or {}
+        historical_context = prediction.get("historical_context") or {}
+        score_lambda_settings = prediction.get("score_lambda_settings") or {}
         candidates.append(
             {
                 "generated_at": generated_at.isoformat(),
@@ -3203,6 +4131,25 @@ def serialize_training_candidates(rows: List[dict], generated_at: dt.datetime) -
                 "away_rotation_flag": prematch.get("away_rotation_flag", 0),
                 "must_win_flag_home": prematch.get("must_win_flag_home", 0),
                 "must_win_flag_away": prematch.get("must_win_flag_away", 0),
+                "group_motivation": prematch.get("group_motivation", {}),
+                "group_motivation_summary": prematch.get("group_motivation_summary", ""),
+                "group_motivation_source": prematch.get("group_motivation_source", ""),
+                "home_last5_goals_for": historical_context.get("home_last5_goals_for", 0),
+                "home_last5_goals_against": historical_context.get("home_last5_goals_against", 0),
+                "away_last5_goals_for": historical_context.get("away_last5_goals_for", 0),
+                "away_last5_goals_against": historical_context.get("away_last5_goals_against", 0),
+                "home_last10_goals_for": historical_context.get("home_last10_goals_for", 0),
+                "home_last10_goals_against": historical_context.get("home_last10_goals_against", 0),
+                "away_last10_goals_for": historical_context.get("away_last10_goals_for", 0),
+                "away_last10_goals_against": historical_context.get("away_last10_goals_against", 0),
+                "home_rest_days": historical_context.get("home_rest_days", 0),
+                "away_rest_days": historical_context.get("away_rest_days", 0),
+                "home_rest_days_model": historical_context.get("home_rest_days_model", 0),
+                "away_rest_days_model": historical_context.get("away_rest_days_model", 0),
+                "home_recent_match_count": historical_context.get("home_recent_match_count", 0),
+                "away_recent_match_count": historical_context.get("away_recent_match_count", 0),
+                "historical_context": historical_context,
+                "score_lambda_settings": score_lambda_settings,
                 "temperature_c": prematch.get("temperature_c", 0),
                 "humidity_pct": prematch.get("humidity_pct", 0),
                 "wind_kph": prematch.get("wind_kph", 0),

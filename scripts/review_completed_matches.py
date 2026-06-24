@@ -18,6 +18,7 @@ REVIEW_DOCS_DIR = ROOT / "docs" / "review"
 STATS_RESULTS_PATH = ROOT / "data" / "raw" / "statsbomb_matches_real.json"
 WC2026_RESULTS_PATH = ROOT / "data" / "raw" / "wc2026_football_data_matches.json"
 CALIBRATION_PATH = ROOT / "config" / "bayesian_calibration.json"
+SCORE_MODEL_PATH = ROOT / "models" / "score_model" / "score_model_v1.json"
 PREMATCH_HISTORY_PATH = ROOT / "data" / "raw" / "prematch_team_news_history.json"
 OUTCOME_NAMES = ["主胜", "平", "客胜"]
 DIAGNOSIS_LABELS = {
@@ -48,15 +49,22 @@ MISTAKE_TAG_LABELS = {
 }
 
 from worldcup_agent import (  # noqa: E402
+    apply_monte_carlo_validation,
+    asian_handicap_probabilities_from_score_grid,
     asian_handicap_return_units,
     calibrate_wdl_probabilities,
     estimate_match_probabilities,
     infer_team_strengths,
+    load_risk_config,
     load_prematch_team_news,
     load_probability_model,
+    load_score_model,
     market_probabilities_from_odds,
+    monte_carlo_validate_score_prediction,
     normalize_text,
+    score_prediction_from_trained_model,
     score_prediction_from_wdl,
+    total_goals_probabilities_from_score_grid,
     total_goals_return_units,
 )
 from ai_probability_adjustment import adjust_probabilities_with_ai_context  # noqa: E402
@@ -294,6 +302,9 @@ def build_full_playback_samples(results: List[Dict[str, object]]) -> List[Dict[s
     model = load_probability_model(model_path)
     strengths = infer_team_strengths(model)
     calibration_config = load_probability_config()
+    risk_config = load_risk_config(CALIBRATION_PATH)
+    score_model = load_score_model(SCORE_MODEL_PATH)
+    prematch_news_index = load_combined_prematch_news_index()
     samples: List[Dict[str, object]] = []
     for actual in results:
         home = str(actual.get("home_team", ""))
@@ -309,11 +320,54 @@ def build_full_playback_samples(results: List[Dict[str, object]]) -> List[Dict[s
         actual_home = int(actual.get("home_goals", 0))
         actual_away = int(actual.get("away_goals", 0))
         outcome_idx = actual_outcome(actual_home, actual_away)
-        score_prediction = score_prediction_from_wdl(probs)
+        match_time = str(actual.get("match_time", ""))
+        trained_prediction = score_prediction_from_trained_model(
+            score_model,
+            home,
+            away,
+            str(actual.get("stage", "")),
+            str(actual.get("group_name", "")),
+            match_time,
+            [0.0, 0.0, 0.0],
+            fallback_probabilities=probs,
+            strengths=strengths,
+            prematch_news_index=prematch_news_index,
+            score_goal_diff_shrink=float(risk_config.get("score_goal_diff_shrink", 0.0) or 0.0),
+            btts_promotion_weight=float(risk_config.get("score_btts_promotion_weight", 0.0) or 0.0),
+            high_total_promotion_weight=float(risk_config.get("score_high_total_promotion_weight", 0.0) or 0.0),
+            btts_total_threshold=float(risk_config.get("score_btts_total_threshold", 2.55) or 2.55),
+            score_lambda_cap=float(risk_config.get("score_lambda_cap", 4.5) or 4.5),
+            score_lambda_global_scale=float(risk_config.get("score_lambda_global_scale", 1.0) or 1.0),
+            score_recent_feature_scale=float(risk_config.get("score_recent_feature_scale", 0.0) or 0.0),
+            score_rest_feature_scale=float(risk_config.get("score_rest_feature_scale", 0.0) or 0.0),
+            score_historical_lambda_mix=float(risk_config.get("score_historical_lambda_mix", 1.0) or 1.0),
+            score_common_result_boost=float(risk_config.get("score_common_result_boost", 0.0) or 0.0),
+            score_draw_candidate_boost=float(risk_config.get("score_draw_candidate_boost", 0.0) or 0.0),
+            score_top5_to_top3_btts_boost=float(risk_config.get("score_top5_to_top3_btts_boost", 0.0) or 0.0),
+            score_top5_to_top3_high_total_boost=float(risk_config.get("score_top5_to_top3_high_total_boost", 0.0) or 0.0),
+            score_big_margin_tail_boost=float(risk_config.get("score_big_margin_tail_boost", 0.0) or 0.0),
+            score_open_game_top5_gap_ratio=float(risk_config.get("score_open_game_top5_gap_ratio", 0.0) or 0.0),
+            score_open_game_top5_direct_boost=float(risk_config.get("score_open_game_top5_direct_boost", 0.0) or 0.0),
+        )
+        score_prediction = trained_prediction or score_prediction_from_wdl(
+            probs,
+            score_goal_diff_shrink=float(risk_config.get("score_goal_diff_shrink", 0.0) or 0.0),
+            btts_promotion_weight=float(risk_config.get("score_btts_promotion_weight", 0.0) or 0.0),
+            high_total_promotion_weight=float(risk_config.get("score_high_total_promotion_weight", 0.0) or 0.0),
+            btts_total_threshold=float(risk_config.get("score_btts_total_threshold", 2.55) or 2.55),
+            common_result_boost=float(risk_config.get("score_common_result_boost", 0.0) or 0.0),
+            draw_candidate_boost=float(risk_config.get("score_draw_candidate_boost", 0.0) or 0.0),
+            top5_to_top3_btts_boost=float(risk_config.get("score_top5_to_top3_btts_boost", 0.0) or 0.0),
+            top5_to_top3_high_total_boost=float(risk_config.get("score_top5_to_top3_high_total_boost", 0.0) or 0.0),
+            big_margin_tail_boost=float(risk_config.get("score_big_margin_tail_boost", 0.0) or 0.0),
+            open_game_top5_gap_ratio=float(risk_config.get("score_open_game_top5_gap_ratio", 0.0) or 0.0),
+            open_game_top5_direct_boost=float(risk_config.get("score_open_game_top5_direct_boost", 0.0) or 0.0),
+        )
         diagnosis = score_diagnosis(score_prediction, actual_home, actual_away, probs)
+        funnel_diagnosis = top5_to_top3_diagnosis(score_prediction, actual_home, actual_away)
         samples.append(
             {
-                "match_time": actual.get("match_time", ""),
+                "match_time": match_time,
                 "home": home,
                 "away": away,
                 "actual_score": f"{actual_home}-{actual_away}",
@@ -325,11 +379,73 @@ def build_full_playback_samples(results: List[Dict[str, object]]) -> List[Dict[s
                 "exact_hit": top1_hit(score_prediction, actual_home, actual_away),
                 "top3_hit": top3_hit(score_prediction, actual_home, actual_away),
                 "top5_hit": top5_hit(score_prediction, actual_home, actual_away),
+                **funnel_diagnosis,
                 **diagnosis,
                 "sample_source": source,
             }
         )
     return samples
+
+
+def playback_review_row(actual: Dict[str, object], playback_row: Dict[str, object]) -> Dict[str, object]:
+    actual_home = int(actual.get("home_goals", 0))
+    actual_away = int(actual.get("away_goals", 0))
+    outcome_idx = actual_outcome(actual_home, actual_away)
+    model_probs = normalize_probs(playback_row.get("model_probabilities"))
+    predicted_top3 = playback_row.get("predicted_top3") or []
+    exact = bool(playback_row.get("exact_hit"))
+    top3 = bool(playback_row.get("top3_hit"))
+    top5 = bool(playback_row.get("top5_hit"))
+    diagnosis = score_diagnosis({"top_scores": predicted_top3}, actual_home, actual_away, model_probs)
+    funnel_diagnosis = {
+        "candidate_rank": None,
+        "top5_to_top3_diagnosis": list(playback_row.get("top5_to_top3_diagnosis") or []),
+    }
+    mistake_tags = outcome_mistake_tags(
+        outcome_idx,
+        model_probs,
+        base_probs=model_probs,
+        market_probs=None,
+        score_top3_hit_value=top3,
+        ai_adjustment=None,
+    )
+    return {
+        "match_time": actual.get("match_time", ""),
+        "home": actual.get("home_team", ""),
+        "away": actual.get("away_team", ""),
+        "actual_score": f"{actual_home}-{actual_away}",
+        "actual_outcome": OUTCOME_NAMES[outcome_idx],
+        "actual_outcome_idx": outcome_idx,
+        "snapshot": "",
+        "generated_at": "",
+        "base_model_probabilities": model_probs,
+        "context_adjusted_probabilities": model_probs,
+        "weather_adjusted_probabilities": model_probs,
+        "tactical_adjusted_probabilities": None,
+        "value_adjusted_probabilities": None,
+        "model_probabilities": model_probs,
+        "market_probabilities": None,
+        "fused_probabilities": model_probs,
+        "normal_odds_change": None,
+        "ai_adjustment": {},
+        "applied_tactical": False,
+        "applied_value": False,
+        "applied_weather": False,
+        "mistake_tags": mistake_tags,
+        "base_model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: model_probs[idx])] if model_probs else None,
+        "context_model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: model_probs[idx])] if model_probs else None,
+        "tactical_model_top_outcome": None,
+        "value_model_top_outcome": None,
+        "model_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: model_probs[idx])] if model_probs else None,
+        "fused_top_outcome": OUTCOME_NAMES[max(range(3), key=lambda idx: model_probs[idx])] if model_probs else None,
+        "predicted_top3": predicted_top3,
+        "exact_hit": exact,
+        "top3_hit": top3,
+        "top5_hit": top5,
+        "review_source": "full_playback_proxy",
+        **funnel_diagnosis,
+        **diagnosis,
+    }
 
 
 def snapshot_files() -> List[Path]:
@@ -426,7 +542,7 @@ def actual_outcome(home_goals: int, away_goals: int) -> int:
 
 
 def normalize_probs(values: object) -> Optional[Tuple[float, float, float]]:
-    if not isinstance(values, list) or len(values) < 3:
+    if not isinstance(values, (list, tuple)) or len(values) < 3:
         return None
     try:
         probs = tuple(max(float(values[idx]), 0.0) for idx in range(3))
@@ -439,7 +555,7 @@ def normalize_probs(values: object) -> Optional[Tuple[float, float, float]]:
 
 
 def market_probs_from_odds(values: object) -> Optional[Tuple[float, float, float]]:
-    if not isinstance(values, list) or len(values) < 3:
+    if not isinstance(values, (list, tuple)) or len(values) < 3:
         return None
     try:
         odds = [float(values[idx]) for idx in range(3)]
@@ -450,6 +566,32 @@ def market_probs_from_odds(values: object) -> Optional[Tuple[float, float, float
     implied = [1.0 / value for value in odds]
     total = sum(implied)
     return implied[0] / total, implied[1] / total, implied[2] / total
+
+
+def normalize_prob_pair(values: object) -> Optional[Tuple[float, float]]:
+    if not isinstance(values, (list, tuple)) or len(values) < 2:
+        return None
+    try:
+        first = max(float(values[0]), 0.0)
+        second = max(float(values[1]), 0.0)
+    except (TypeError, ValueError):
+        return None
+    total = first + second
+    if total <= 0:
+        return None
+    return first / total, second / total
+
+
+def safe_float_list(values: object, limit: int) -> List[float]:
+    if not isinstance(values, (list, tuple)):
+        return [0.0] * limit
+    result: List[float] = []
+    for idx in range(limit):
+        try:
+            result.append(float(values[idx]))
+        except (IndexError, TypeError, ValueError):
+            result.append(0.0)
+    return result
 
 
 def brier(probabilities: Tuple[float, float, float], outcome_idx: int) -> float:
@@ -489,6 +631,13 @@ def top5_hit(prediction: Dict[str, object], actual_home: int, actual_away: int) 
 
 
 def top_n_hit(prediction: Dict[str, object], actual_home: int, actual_away: int, limit: int) -> bool:
+    for home, away, _prob in score_candidates(prediction, limit):
+        if int(home) == actual_home and int(away) == actual_away:
+            return True
+    return False
+
+
+def score_candidates(prediction: Dict[str, object], limit: int) -> List[Tuple[int, int, float]]:
     raw_top = prediction.get("top_scores") or []
     top_scores: List[Tuple[int, int, float]] = []
     for item in raw_top:
@@ -502,10 +651,38 @@ def top_n_hit(prediction: Dict[str, object], actual_home: int, actual_away: int,
                 top_scores.append((home, away, prob))
                 if len(top_scores) >= limit:
                     break
-    for home, away, _prob in top_scores[:limit]:
+    return top_scores[:limit]
+
+
+def score_candidate_rank(prediction: Dict[str, object], actual_home: int, actual_away: int, limit: int = 10) -> Optional[int]:
+    for idx, (home, away, _prob) in enumerate(score_candidates(prediction, limit), start=1):
         if int(home) == actual_home and int(away) == actual_away:
-            return True
-    return False
+            return idx
+    return None
+
+
+def top5_to_top3_diagnosis(prediction: Dict[str, object], actual_home: int, actual_away: int) -> Dict[str, object]:
+    rank = score_candidate_rank(prediction, actual_home, actual_away, limit=10)
+    labels: List[str] = []
+    if rank is not None and 4 <= rank <= 5:
+        labels.append("top5_only_hit")
+        top3 = score_candidates(prediction, 3)
+        if top3:
+            actual_total = actual_home + actual_away
+            actual_margin = abs(actual_home - actual_away)
+            avg_top3_total = sum(home + away for home, away, _prob in top3) / len(top3)
+            avg_top3_margin = sum(abs(home - away) for home, away, _prob in top3) / len(top3)
+            if actual_total >= avg_top3_total + 1.0:
+                labels.append("actual_total_higher_than_top3")
+            elif actual_total <= avg_top3_total - 1.0:
+                labels.append("actual_total_lower_than_top3")
+            if actual_margin >= avg_top3_margin + 1.0:
+                labels.append("actual_margin_bigger_than_top3")
+            if actual_home == actual_away and not any(home == away for home, away, _prob in top3):
+                labels.append("draw_outside_top3")
+            if min(actual_home, actual_away) >= 1 and not any(min(home, away) >= 1 for home, away, _prob in top3):
+                labels.append("both_teams_score_outside_top3")
+    return {"candidate_rank": rank, "top5_to_top3_diagnosis": labels}
 
 
 def ranked_scores(prediction: Dict[str, object], limit: int = 3) -> List[Tuple[int, int, float]]:
@@ -674,6 +851,145 @@ def score_market_direction_diagnosis(prediction_row: Dict[str, object], actual_h
     return result
 
 
+def rebuild_counterfactual_score_prediction(
+    prediction_row: Dict[str, object],
+    score_model: Optional[Dict[str, object]],
+    strengths: Dict[str, float],
+    prematch_news_index: Optional[Dict[Tuple[str, str, str], Dict[str, object]]],
+    risk_config: Dict[str, float],
+    score_param_overrides: Optional[Dict[str, float]] = None,
+) -> Optional[Dict[str, object]]:
+    score_param_overrides = score_param_overrides or {}
+
+    def param(name: str, default: float) -> float:
+        value = score_param_overrides.get(name, risk_config.get(name, default))
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    probs = normalize_probs(prediction_row.get("probabilities")) or normalize_probs(prediction_row.get("fused_probabilities"))
+    if not probs:
+        return None
+    home = str(prediction_row.get("home", ""))
+    away = str(prediction_row.get("away", ""))
+    match_time = str(prediction_row.get("match_time", ""))
+    normal_odds = safe_float_list(prediction_row.get("normal_odds"), 3)
+    handicap_line = safe_float(prediction_row.get("handicap"))
+    handicap_market = normalize_probs(prediction_row.get("handicap_market_probabilities"))
+    asian_line = safe_float(prediction_row.get("asian_handicap_line"))
+    asian_market = normalize_prob_pair(prediction_row.get("asian_handicap_market_probabilities"))
+    total_line = safe_float(prediction_row.get("total_goals_line"))
+    total_market = normalize_prob_pair(prediction_row.get("total_goals_market_probabilities"))
+
+    score_prediction = score_prediction_from_trained_model(
+        score_model=score_model,
+        home=home,
+        away=away,
+        stage=str(prediction_row.get("stage", "小组赛")),
+        round_text=str(prediction_row.get("round", "")),
+        match_time=match_time,
+        normal_odds=normal_odds,
+        fallback_probabilities=probs,
+        strengths=strengths,
+        prematch_news_index=prematch_news_index,
+        handicap_line=handicap_line,
+        handicap_market_probabilities=handicap_market,
+        asian_handicap_line=asian_line,
+        asian_market_probabilities=asian_market,
+        total_goals_line=total_line,
+        total_goals_market_probabilities=total_market,
+        score_goal_diff_shrink=param("score_goal_diff_shrink", 0.0),
+        btts_promotion_weight=param("score_btts_promotion_weight", 0.0),
+        high_total_promotion_weight=param("score_high_total_promotion_weight", 0.0),
+        btts_total_threshold=param("score_btts_total_threshold", 2.55),
+        score_common_result_boost=param("score_common_result_boost", 0.0),
+        score_draw_candidate_boost=param("score_draw_candidate_boost", 0.0),
+        score_top5_to_top3_btts_boost=param("score_top5_to_top3_btts_boost", 0.0),
+        score_top5_to_top3_high_total_boost=param("score_top5_to_top3_high_total_boost", 0.0),
+        score_big_margin_tail_boost=param("score_big_margin_tail_boost", 0.0),
+        score_open_game_top5_gap_ratio=param("score_open_game_top5_gap_ratio", 0.0),
+        score_open_game_top5_direct_boost=param("score_open_game_top5_direct_boost", 0.0),
+    ) or score_prediction_from_wdl(
+        probs,
+        handicap_line,
+        handicap_market,
+        asian_line,
+        asian_market,
+        total_line,
+        total_market,
+        param("score_goal_diff_shrink", 0.0),
+        param("score_btts_promotion_weight", 0.0),
+        param("score_high_total_promotion_weight", 0.0),
+        param("score_btts_total_threshold", 2.55),
+        param("score_common_result_boost", 0.0),
+        param("score_draw_candidate_boost", 0.0),
+        param("score_top5_to_top3_btts_boost", 0.0),
+        param("score_top5_to_top3_high_total_boost", 0.0),
+        param("score_big_margin_tail_boost", 0.0),
+        param("score_open_game_top5_gap_ratio", 0.0),
+        param("score_open_game_top5_direct_boost", 0.0),
+    )
+    if score_prediction and risk_config.get("enable_monte_carlo", 1.0) > 0:
+        market_probs = market_probs_from_odds(normal_odds) or normalize_probs(prediction_row.get("market_probabilities"))
+        monte_carlo = monte_carlo_validate_score_prediction(
+            score_prediction,
+            risk_config,
+            target_probabilities=probs,
+            market_probabilities=market_probs,
+            handicap_line=handicap_line,
+            handicap_market_probabilities=handicap_market,
+            asian_handicap_line=asian_line,
+            asian_market_probabilities=asian_market,
+            total_goals_line=total_line,
+            total_goals_market_probabilities=total_market,
+        )
+        score_prediction = apply_monte_carlo_validation(score_prediction, monte_carlo)
+    return score_prediction
+
+
+def counterfactual_score_row(
+    prediction_row: Dict[str, object],
+    actual_home: int,
+    actual_away: int,
+    model_probs: Optional[Tuple[float, float, float]],
+    score_prediction: Optional[Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    if not score_prediction:
+        return None
+    exact = top1_hit(score_prediction, actual_home, actual_away)
+    top3 = top3_hit(score_prediction, actual_home, actual_away)
+    top5 = top5_hit(score_prediction, actual_home, actual_away)
+    diagnosis = score_diagnosis(score_prediction, actual_home, actual_away, model_probs)
+    funnel_diagnosis = top5_to_top3_diagnosis(score_prediction, actual_home, actual_away)
+    market_row = dict(prediction_row)
+    score_grid = score_prediction.get("score_grid")
+    if isinstance(score_grid, list):
+        asian_line = safe_float(prediction_row.get("asian_handicap_line"))
+        total_line = safe_float(prediction_row.get("total_goals_line"))
+        if asian_line is not None:
+            market_row["asian_handicap_probabilities"] = asian_handicap_probabilities_from_score_grid(score_grid, asian_line)
+        if total_line is not None:
+            market_row["total_goals_probabilities"] = total_goals_probabilities_from_score_grid(score_grid, total_line)
+    market_diagnosis = score_market_direction_diagnosis(market_row, actual_home, actual_away)
+    return {
+        "match_time": prediction_row.get("match_time", ""),
+        "home": prediction_row.get("home", ""),
+        "away": prediction_row.get("away", ""),
+        "actual_score": f"{actual_home}-{actual_away}",
+        "snapshot": prediction_row.get("snapshot", ""),
+        "generated_at": prediction_row.get("generated_at", ""),
+        "predicted_top3": score_prediction.get("top_scores") or [],
+        "exact_hit": exact,
+        "top3_hit": top3,
+        "top5_hit": top5,
+        "market_lambda_adjustments": score_prediction.get("market_lambda_adjustments"),
+        **market_diagnosis,
+        **funnel_diagnosis,
+        **diagnosis,
+    }
+
+
 def direction_hit_summary(reviewed: List[Dict[str, object]], field: str) -> Dict[str, object]:
     rows = [row for row in reviewed if isinstance(row.get(field), bool)]
     if not rows:
@@ -684,6 +1000,39 @@ def direction_hit_summary(reviewed: List[Dict[str, object]], field: str) -> Dict
         "hit_rate": hits / len(rows),
         "hit_count": hits,
         "miss_count": len(rows) - hits,
+    }
+
+
+def top5_to_top3_summary(reviewed: List[Dict[str, object]]) -> Dict[str, object]:
+    top5_only = [row for row in reviewed if row.get("top5_hit") and not row.get("top3_hit")]
+    labels = [label for row in reviewed for label in row.get("top5_to_top3_diagnosis", [])]
+    btts_count = 0
+    higher_total_count = 0
+    bigger_margin_count = 0
+    draw_count = 0
+    for row in top5_only:
+        try:
+            home_text, away_text = str(row.get("actual_score", "0-0")).split("-", 1)
+            actual_home = int(home_text)
+            actual_away = int(away_text)
+        except (TypeError, ValueError):
+            continue
+        if actual_home > 0 and actual_away > 0:
+            btts_count += 1
+        if actual_home == actual_away:
+            draw_count += 1
+        if actual_home + actual_away >= 3:
+            higher_total_count += 1
+        if abs(actual_home - actual_away) >= 2:
+            bigger_margin_count += 1
+    return {
+        "top5_only_count": len(top5_only),
+        "top5_only_rate": len(top5_only) / len(reviewed) if reviewed else 0.0,
+        "top5_only_btts_count": btts_count,
+        "top5_only_higher_total_count": higher_total_count,
+        "top5_only_bigger_margin_count": bigger_margin_count,
+        "top5_only_draw_count": draw_count,
+        "diagnosis_counts": {label: labels.count(label) for label in sorted(set(labels))},
     }
 
 
@@ -706,6 +1055,7 @@ def score_metric_summary(reviewed: List[Dict[str, object]], exact_hits: int, top
         "avg_abs_goal_diff_error": metric_summary([abs(value) for value in diff_errors]),
         "total_goals_direction": direction_hit_summary(reviewed, "total_goals_direction_hit"),
         "asian_handicap_direction": direction_hit_summary(reviewed, "asian_handicap_direction_hit"),
+        "top5_to_top3": top5_to_top3_summary(reviewed),
         "underestimated_total_goals_rate": label_rate("underestimated_total_goals"),
         "overestimated_total_goals_rate": label_rate("overestimated_total_goals"),
         "underestimated_draw_rate": label_rate("underestimated_draw"),
@@ -714,6 +1064,101 @@ def score_metric_summary(reviewed: List[Dict[str, object]], exact_hits: int, top
         "wrong_goal_diff_direction_rate": label_rate("wrong_goal_diff_direction"),
         "score_distribution_too_narrow_rate": label_rate("score_distribution_too_narrow"),
     }
+
+
+def score_metric_delta(before: Dict[str, object], after: Dict[str, object]) -> Dict[str, object]:
+    keys = (
+        "exact_score_accuracy",
+        "top3_hit_rate",
+        "top5_hit_rate",
+        "avg_abs_total_goals_error",
+        "avg_abs_goal_diff_error",
+        "underestimated_total_goals_rate",
+        "score_distribution_too_narrow_rate",
+    )
+    delta: Dict[str, object] = {}
+    for key in keys:
+        before_value = before.get(key)
+        after_value = after.get(key)
+        if isinstance(before_value, (int, float)) and isinstance(after_value, (int, float)):
+            delta[key] = after_value - before_value
+    return delta
+
+
+def counterfactual_score_value(metrics: Dict[str, object]) -> float:
+    exact = float(metrics.get("exact_score_accuracy", 0.0) or 0.0)
+    top3 = float(metrics.get("top3_hit_rate", 0.0) or 0.0)
+    top5 = float(metrics.get("top5_hit_rate", 0.0) or 0.0)
+    total_mae = float(metrics.get("avg_abs_total_goals_error", 0.0) or 0.0)
+    diff_mae = float(metrics.get("avg_abs_goal_diff_error", 0.0) or 0.0)
+    return exact * 2.0 + top3 * 1.5 + top5 * 0.5 - total_mae * 0.15 - diff_mae * 0.15
+
+
+def counterfactual_score_parameter_grid() -> List[Dict[str, float]]:
+    rows: List[Dict[str, float]] = []
+    for shrink in (0.0, 0.03, 0.06, 0.09):
+        for btts in (0.0, 0.03, 0.05, 0.08):
+            for high_total in (0.0, 0.02, 0.04):
+                for threshold in (2.40, 2.55, 2.70):
+                    for open_gap in (0.0, 0.92):
+                        for open_direct in (0.0, 0.08):
+                            rows.append(
+                                {
+                                    "score_goal_diff_shrink": shrink,
+                                    "score_btts_promotion_weight": btts,
+                                    "score_high_total_promotion_weight": high_total,
+                                    "score_btts_total_threshold": threshold,
+                                    "score_open_game_top5_gap_ratio": open_gap,
+                                    "score_open_game_top5_direct_boost": open_direct,
+                                }
+                            )
+    return rows
+
+
+def counterfactual_grid_search(
+    replay_inputs: List[Dict[str, object]],
+    score_model: Optional[Dict[str, object]],
+    strengths: Dict[str, float],
+    prematch_news_index: Optional[Dict[Tuple[str, str, str], Dict[str, object]]],
+    risk_config: Dict[str, float],
+) -> Dict[str, object]:
+    if not replay_inputs:
+        return {"sample_size": 0, "best": None, "candidates": []}
+    search_risk_config = dict(risk_config)
+    search_risk_config["enable_monte_carlo"] = 0.0
+    candidates: List[Dict[str, object]] = []
+    for params in counterfactual_score_parameter_grid():
+        rows: List[Dict[str, object]] = []
+        exact_hits = top3_hits = top5_hits = 0
+        for item in replay_inputs:
+            prediction_row = item.get("prediction_row")
+            if not isinstance(prediction_row, dict):
+                continue
+            actual_home = int(item.get("actual_home", 0))
+            actual_away = int(item.get("actual_away", 0))
+            model_probs = item.get("model_probs")
+            if not isinstance(model_probs, tuple):
+                model_probs = None
+            prediction = rebuild_counterfactual_score_prediction(
+                prediction_row,
+                score_model,
+                strengths,
+                prematch_news_index,
+                search_risk_config,
+                score_param_overrides=params,
+            )
+            row = counterfactual_score_row(prediction_row, actual_home, actual_away, model_probs, prediction)
+            if not row:
+                continue
+            exact_hits += 1 if row.get("exact_hit") else 0
+            top3_hits += 1 if row.get("top3_hit") else 0
+            top5_hits += 1 if row.get("top5_hit") else 0
+            rows.append(row)
+        metrics = score_metric_summary(rows, exact_hits, top3_hits, top5_hits)
+        value = counterfactual_score_value(metrics)
+        candidates.append({"params": params, "score_value": value, "score_metrics": metrics, "sample_size": len(rows)})
+    candidates.sort(key=lambda row: float(row.get("score_value", -9999.0)), reverse=True)
+    return {"sample_size": len(replay_inputs), "best": candidates[0] if candidates else None, "candidates": candidates[:10]}
 
 
 def diagnosis_label_text(labels: object) -> str:
@@ -963,6 +1408,30 @@ def probability_stats(reviewed: List[Dict[str, object]], field: str) -> Dict[str
     }
 
 
+def review_bucket(rows: List[Dict[str, object]]) -> Dict[str, object]:
+    exact_hits = sum(1 for row in rows if row.get("exact_hit"))
+    top3_hits = sum(1 for row in rows if row.get("top3_hit"))
+    top5_hits = sum(1 for row in rows if row.get("top5_hit"))
+    return {
+        "sample_size": len(rows),
+        "score_metrics": score_metric_summary(rows, exact_hits, top3_hits, top5_hits),
+        "probability_metrics": {
+            "base": probability_stats(rows, "base_model_probabilities"),
+            "context": probability_stats(rows, "context_adjusted_probabilities"),
+            "weather": probability_stats(rows, "weather_adjusted_probabilities"),
+            "tactical": probability_stats(rows, "tactical_adjusted_probabilities"),
+            "value": probability_stats(rows, "value_adjusted_probabilities"),
+            "model": probability_stats(rows, "model_probabilities"),
+            "market": probability_stats(rows, "market_probabilities"),
+            "fused": probability_stats(rows, "fused_probabilities"),
+        },
+        "mistake_tag_metrics": mistake_tag_summary(rows),
+        "adjustment_module_metrics": adjustment_module_metrics(rows),
+        "odds_movement_metrics": odds_movement_summary(rows),
+        "odds_outcome_cross_metrics": odds_outcome_cross_metrics(rows),
+    }
+
+
 def build_advice(summary: Dict[str, object], reviewed: List[Dict[str, object]]) -> List[str]:
     advice = []
     base_stats = summary["probability_metrics"].get("base", {})
@@ -1044,7 +1513,9 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
             "max_total_stake": 15.0,
         }
 
-    probability_metrics = summary["probability_metrics"]
+    snapshot_metrics = summary.get("snapshot_metrics", {}) if isinstance(summary.get("snapshot_metrics"), dict) else {}
+    combined_metrics = summary.get("combined_metrics", {}) if isinstance(summary.get("combined_metrics"), dict) else {}
+    probability_metrics = snapshot_metrics.get("probability_metrics") if isinstance(snapshot_metrics.get("probability_metrics"), dict) else summary["probability_metrics"]
     model_stats = probability_metrics["model"]
     base_stats = probability_metrics.get("base", {})
     context_stats = probability_metrics.get("context", {})
@@ -1056,7 +1527,8 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
     full_playback = summary.get("full_playback", {}) if isinstance(summary.get("full_playback"), dict) else {}
     full_model_stats = full_playback.get("probability_metrics", {}).get("model", {}) if isinstance(full_playback.get("probability_metrics"), dict) else {}
     full_score_metrics = full_playback.get("score_metrics", {}) if isinstance(full_playback.get("score_metrics"), dict) else {}
-    sample_size = int(summary["reviewed_matches"])
+    sample_size = int(summary.get("matched_snapshot_matches", 0) or 0)
+    combined_score_metrics = combined_metrics.get("score_metrics", summary["score_metrics"]) if isinstance(combined_metrics, dict) else summary["score_metrics"]
     config.setdefault("draw_probability_floor", 0.22)
     config.setdefault("balanced_match_draw_floor", 0.26)
     config.setdefault("strong_favorite_draw_floor", 0.25)
@@ -1068,9 +1540,13 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
     config.setdefault("ai_probability_high_confidence_delta", 0.05)
     config.setdefault("weather_adjustment_weight", 1.0)
     config.setdefault("weather_adjustment_max_delta", 0.02)
+    config.setdefault("auto_apply_review_probability_params", 0.0)
+    config.setdefault("auto_apply_review_score_params", 0.0)
+    config.setdefault("auto_apply_requires_joint_backtest", 1.0)
 
     config["calibration"] = {
         "sample_size": sample_size,
+        "combined_sample_size": int(summary["reviewed_matches"]),
         "base_model_accuracy": base_stats.get("accuracy"),
         "context_model_accuracy": context_stats.get("accuracy"),
         "weather_model_accuracy": weather_stats.get("accuracy"),
@@ -1095,21 +1571,21 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         "model_logloss": model_stats["logloss"],
         "market_logloss": market_stats["logloss"],
         "fused_logloss": fused_stats["logloss"],
-        "score_exact_accuracy": summary["score_metrics"]["exact_score_accuracy"],
-        "score_top3_hit_rate": summary["score_metrics"]["top3_hit_rate"],
-        "score_top5_hit_rate": summary["score_metrics"].get("top5_hit_rate"),
-        "avg_total_goals_error": summary["score_metrics"].get("avg_total_goals_error"),
-        "avg_abs_total_goals_error": summary["score_metrics"].get("avg_abs_total_goals_error"),
-        "avg_goal_diff_error": summary["score_metrics"].get("avg_goal_diff_error"),
-        "avg_abs_goal_diff_error": summary["score_metrics"].get("avg_abs_goal_diff_error"),
-        "total_goals_direction_metrics": summary["score_metrics"].get("total_goals_direction"),
-        "asian_handicap_direction_metrics": summary["score_metrics"].get("asian_handicap_direction"),
-        "underestimated_total_goals_rate": summary["score_metrics"].get("underestimated_total_goals_rate"),
-        "underestimated_draw_rate": summary["score_metrics"].get("underestimated_draw_rate"),
-        "underestimated_underdog_goal_rate": summary["score_metrics"].get("underestimated_underdog_goal_rate"),
-        "underestimated_big_win_rate": summary["score_metrics"].get("underestimated_big_win_rate"),
-        "mistake_tag_metrics": summary.get("mistake_tag_metrics"),
-        "adjustment_module_metrics": summary.get("adjustment_module_metrics"),
+        "score_exact_accuracy": combined_score_metrics["exact_score_accuracy"],
+        "score_top3_hit_rate": combined_score_metrics["top3_hit_rate"],
+        "score_top5_hit_rate": combined_score_metrics.get("top5_hit_rate"),
+        "avg_total_goals_error": combined_score_metrics.get("avg_total_goals_error"),
+        "avg_abs_total_goals_error": combined_score_metrics.get("avg_abs_total_goals_error"),
+        "avg_goal_diff_error": combined_score_metrics.get("avg_goal_diff_error"),
+        "avg_abs_goal_diff_error": combined_score_metrics.get("avg_abs_goal_diff_error"),
+        "total_goals_direction_metrics": combined_score_metrics.get("total_goals_direction"),
+        "asian_handicap_direction_metrics": combined_score_metrics.get("asian_handicap_direction"),
+        "underestimated_total_goals_rate": combined_score_metrics.get("underestimated_total_goals_rate"),
+        "underestimated_draw_rate": combined_score_metrics.get("underestimated_draw_rate"),
+        "underestimated_underdog_goal_rate": combined_score_metrics.get("underestimated_underdog_goal_rate"),
+        "underestimated_big_win_rate": combined_score_metrics.get("underestimated_big_win_rate"),
+        "mistake_tag_metrics": snapshot_metrics.get("mistake_tag_metrics") if isinstance(snapshot_metrics, dict) else summary.get("mistake_tag_metrics"),
+        "adjustment_module_metrics": snapshot_metrics.get("adjustment_module_metrics") if isinstance(snapshot_metrics, dict) else summary.get("adjustment_module_metrics"),
         "last_review_file": summary["review_file"],
     }
     if full_playback:
@@ -1195,19 +1671,57 @@ def update_calibration_config(summary: Dict[str, object]) -> None:
         config["calibration"]["risk_adjustment_decision"] = "keep_current_risk_settings"
 
     full_sample_size = int(full_playback.get("sample_size", 0) or 0) if full_playback else 0
+    candidate_probability_params: Optional[Dict[str, float]] = None
     if full_sample_size >= 10:
         draw_rows = [row for row in summary.get("full_playback_matches", []) if int(row.get("actual_outcome_idx", -1)) == 1 and row.get("model_probabilities")]
         low_draw_hits = [row for row in draw_rows if row["model_probabilities"][1] < 0.25]
         if draw_rows and len(low_draw_hits) / len(draw_rows) >= 0.4:
-            config["draw_probability_floor"] = min(0.26, max(float(config.get("draw_probability_floor", 0.22)), 0.23))
-            config["balanced_match_draw_floor"] = min(0.29, max(float(config.get("balanced_match_draw_floor", 0.26)), 0.27))
-            config["strong_favorite_draw_floor"] = min(0.28, max(float(config.get("strong_favorite_draw_floor", 0.25)), 0.26))
-            config["max_draw_calibration_boost"] = min(0.10, max(float(config.get("max_draw_calibration_boost", 0.08)), 0.09))
-            config["calibration"]["probability_parameter_decision"] = "full_playback_raises_draw_protection"
+            candidate_probability_params = {
+                "draw_probability_floor": min(0.26, max(float(config.get("draw_probability_floor", 0.22)), 0.23)),
+                "balanced_match_draw_floor": min(0.29, max(float(config.get("balanced_match_draw_floor", 0.26)), 0.27)),
+                "strong_favorite_draw_floor": min(0.28, max(float(config.get("strong_favorite_draw_floor", 0.25)), 0.26)),
+                "max_draw_calibration_boost": min(0.10, max(float(config.get("max_draw_calibration_boost", 0.08)), 0.09)),
+                "underdog_probability_floor": float(config.get("underdog_probability_floor", 0.18) or 0.18),
+                "max_underdog_calibration_boost": float(config.get("max_underdog_calibration_boost", 0.03) or 0.03),
+                "probability_temperature": float(config.get("probability_temperature", 1.0) or 1.0),
+                "draw_pick_override_enabled": float(config.get("draw_pick_override_enabled", 1.0) or 1.0),
+                "draw_pick_min_probability": float(config.get("draw_pick_min_probability", 0.26) or 0.26),
+                "draw_pick_max_gap_to_favorite": float(config.get("draw_pick_max_gap_to_favorite", 0.15) or 0.15),
+                "draw_pick_favorite_max_probability": float(config.get("draw_pick_favorite_max_probability", 0.50) or 0.50),
+            }
+            config["calibration"]["probability_parameter_decision"] = "full_playback_generates_probability_candidate"
         else:
             config["calibration"]["probability_parameter_decision"] = "full_playback_keep_probability_parameters"
     elif full_playback:
         config["calibration"]["probability_parameter_decision"] = "full_playback_sample_below_10_keep_parameters"
+
+    candidate_score_params: Optional[Dict[str, float]] = None
+    best_grid = summary.get("counterfactual_grid_search", {}).get("best") if isinstance(summary.get("counterfactual_grid_search"), dict) else None
+    if isinstance(best_grid, dict) and isinstance(best_grid.get("params"), dict):
+        params = best_grid["params"]
+        candidate_score_params = {
+            "score_goal_diff_shrink": float(params.get("score_goal_diff_shrink", config.get("score_goal_diff_shrink", 0.0)) or 0.0),
+            "score_btts_promotion_weight": float(params.get("score_btts_promotion_weight", config.get("score_btts_promotion_weight", 0.0)) or 0.0),
+            "score_high_total_promotion_weight": float(params.get("score_high_total_promotion_weight", config.get("score_high_total_promotion_weight", 0.0)) or 0.0),
+            "score_btts_total_threshold": float(params.get("score_btts_total_threshold", config.get("score_btts_total_threshold", 2.55)) or 2.55),
+            "score_common_result_boost": float(config.get("score_common_result_boost", 0.0) or 0.0),
+            "score_draw_candidate_boost": float(config.get("score_draw_candidate_boost", 0.0) or 0.0),
+            "score_top5_to_top3_btts_boost": float(config.get("score_top5_to_top3_btts_boost", 0.0) or 0.0),
+            "score_top5_to_top3_high_total_boost": float(config.get("score_top5_to_top3_high_total_boost", 0.0) or 0.0),
+            "score_open_game_top5_gap_ratio": float(params.get("score_open_game_top5_gap_ratio", config.get("score_open_game_top5_gap_ratio", 0.0)) or 0.0),
+            "score_open_game_top5_direct_boost": float(params.get("score_open_game_top5_direct_boost", config.get("score_open_game_top5_direct_boost", 0.0)) or 0.0),
+            "score_big_margin_tail_boost": float(config.get("score_big_margin_tail_boost", 0.0) or 0.0),
+        }
+
+    config["calibration"]["candidate_probability_params"] = candidate_probability_params
+    config["calibration"]["candidate_score_params"] = candidate_score_params
+    config["calibration"]["auto_apply_decision"] = "hold_requires_backtest_confirmation"
+    if float(config.get("auto_apply_review_probability_params", 0.0) or 0.0) > 0 and float(config.get("auto_apply_requires_joint_backtest", 1.0) or 1.0) <= 0 and candidate_probability_params:
+        config.update(candidate_probability_params)
+        config["calibration"]["auto_apply_decision"] = "applied_review_probability_candidate"
+    if float(config.get("auto_apply_review_score_params", 0.0) or 0.0) > 0 and float(config.get("auto_apply_requires_joint_backtest", 1.0) or 1.0) <= 0 and candidate_score_params:
+        config.update(candidate_score_params)
+        config["calibration"]["auto_apply_decision"] = "applied_review_score_candidate"
 
     CALIBRATION_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     summary["risk_config"] = {
@@ -1238,6 +1752,15 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
     weather_stats = summary["probability_metrics"].get("weather", {})
     tactical_stats = summary["probability_metrics"].get("tactical", {})
     value_stats = summary["probability_metrics"].get("value", {})
+    snapshot_metrics = summary.get("snapshot_metrics", {}) if isinstance(summary.get("snapshot_metrics"), dict) else {}
+    playback_proxy_metrics = summary.get("playback_proxy_metrics", {}) if isinstance(summary.get("playback_proxy_metrics"), dict) else {}
+    combined_metrics = summary.get("combined_metrics", {}) if isinstance(summary.get("combined_metrics"), dict) else {}
+    snapshot_model = snapshot_metrics.get("probability_metrics", {}).get("model", {}) if isinstance(snapshot_metrics.get("probability_metrics"), dict) else {}
+    snapshot_score = snapshot_metrics.get("score_metrics", {}) if isinstance(snapshot_metrics.get("score_metrics"), dict) else {}
+    proxy_model = playback_proxy_metrics.get("probability_metrics", {}).get("model", {}) if isinstance(playback_proxy_metrics.get("probability_metrics"), dict) else {}
+    proxy_score = playback_proxy_metrics.get("score_metrics", {}) if isinstance(playback_proxy_metrics.get("score_metrics"), dict) else {}
+    combined_model = combined_metrics.get("probability_metrics", {}).get("model", {}) if isinstance(combined_metrics.get("probability_metrics"), dict) else {}
+    combined_score = combined_metrics.get("score_metrics", {}) if isinstance(combined_metrics.get("score_metrics"), dict) else {}
     lines = [
         "# 赛后准确率校准与反思",
         "",
@@ -1247,15 +1770,25 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
         "",
         f"- 扫描预测快照：{summary['snapshots_scanned']} 个",
         f"- 加载赛果：{summary['results_loaded']} 场",
-        f"- 成功匹配赛前预测：{summary['reviewed_matches']} 场",
+        f"- 赛前快照直接匹配：{summary.get('matched_snapshot_matches', summary['reviewed_matches'])} 场",
+        f"- 全量回放代理补齐：{summary.get('playback_proxy_matches', 0)} 场",
+        f"- 最终复盘覆盖：{summary['reviewed_matches']} 场",
         f"- 比分 Exact：{summary['score_metrics']['exact_score_accuracy']:.1%}",
         f"- 比分 Top3：{summary['score_metrics']['top3_hit_rate']:.1%}",
         f"- 比分 Top5：{summary['score_metrics']['top5_hit_rate']:.1%}",
+        f"- 反事实重算 Top3：{summary.get('counterfactual_replay', {}).get('score_metrics', {}).get('top3_hit_rate'):.1%}" if summary.get('counterfactual_replay', {}).get('score_metrics', {}).get('top3_hit_rate') is not None else "- 反事实重算 Top3：暂无",
+        f"- 反事实重算 Top5：{summary.get('counterfactual_replay', {}).get('score_metrics', {}).get('top5_hit_rate'):.1%}" if summary.get('counterfactual_replay', {}).get('score_metrics', {}).get('top5_hit_rate') is not None else "- 反事实重算 Top5：暂无",
         f"- WDL 模型方向准确率：{model_stats['accuracy']:.1%}" if model_stats["accuracy"] is not None else "- WDL 模型方向准确率：暂无",
         f"- AI 修正前 WDL 准确率：{summary['probability_metrics']['base']['accuracy']:.1%}" if summary['probability_metrics']['base']['accuracy'] is not None else "- AI 修正前 WDL 准确率：暂无",
         f"- 模型 Brier：{model_stats['brier']:.4f}" if model_stats["brier"] is not None else "- 模型 Brier：暂无",
         f"- AI 修正前 Brier：{summary['probability_metrics']['base']['brier']:.4f}" if summary['probability_metrics']['base']['brier'] is not None else "- AI 修正前 Brier：暂无",
         f"- 融合 Brier：{fused_stats['brier']:.4f}" if fused_stats["brier"] is not None else "- 融合 Brier：暂无",
+        "",
+        "## 1.A 三套口径摘要",
+        "",
+        f"- 真实快照：样本 {snapshot_metrics.get('sample_size', 0)} 场，WDL {float(snapshot_model.get('accuracy', 0.0) or 0.0):.1%}，Top3 {float(snapshot_score.get('top3_hit_rate', 0.0) or 0.0):.1%}，Top5 {float(snapshot_score.get('top5_hit_rate', 0.0) or 0.0):.1%}。",
+        f"- 代理回放：样本 {playback_proxy_metrics.get('sample_size', 0)} 场，WDL {float(proxy_model.get('accuracy', 0.0) or 0.0):.1%}，Top3 {float(proxy_score.get('top3_hit_rate', 0.0) or 0.0):.1%}，Top5 {float(proxy_score.get('top5_hit_rate', 0.0) or 0.0):.1%}。",
+        f"- 合并口径：样本 {combined_metrics.get('sample_size', 0)} 场，WDL {float(combined_model.get('accuracy', 0.0) or 0.0):.1%}，Top3 {float(combined_score.get('top3_hit_rate', 0.0) or 0.0):.1%}，Top5 {float(combined_score.get('top5_hit_rate', 0.0) or 0.0):.1%}。",
         "",
         "## 1.0 模块独立概率指标",
         "",
@@ -1278,6 +1811,9 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
         f"- 平均净胜球绝对误差：{summary['score_metrics'].get('avg_abs_goal_diff_error'):.2f}" if summary['score_metrics'].get('avg_abs_goal_diff_error') is not None else "- 平均净胜球绝对误差：暂无",
         f"- 大小球方向命中：{summary['score_metrics'].get('total_goals_direction', {}).get('hit_rate'):.1%}（样本 {summary['score_metrics'].get('total_goals_direction', {}).get('sample_size')}）" if summary['score_metrics'].get('total_goals_direction', {}).get('hit_rate') is not None else "- 大小球方向命中：暂无样本",
         f"- 亚盘方向命中：{summary['score_metrics'].get('asian_handicap_direction', {}).get('hit_rate'):.1%}（样本 {summary['score_metrics'].get('asian_handicap_direction', {}).get('sample_size')}）" if summary['score_metrics'].get('asian_handicap_direction', {}).get('hit_rate') is not None else "- 亚盘方向命中：暂无样本",
+        f"- 反事实 Top3 变化：{summary.get('counterfactual_replay', {}).get('score_metric_delta_vs_snapshot', {}).get('top3_hit_rate'):+.1%}" if summary.get('counterfactual_replay', {}).get('score_metric_delta_vs_snapshot', {}).get('top3_hit_rate') is not None else "- 反事实 Top3 变化：暂无",
+        f"- 反事实总进球 MAE 变化：{summary.get('counterfactual_replay', {}).get('score_metric_delta_vs_snapshot', {}).get('avg_abs_total_goals_error'):+.2f}" if summary.get('counterfactual_replay', {}).get('score_metric_delta_vs_snapshot', {}).get('avg_abs_total_goals_error') is not None else "- 反事实总进球 MAE 变化：暂无",
+        f"- 反事实参数搜索最佳 Top3：{summary.get('counterfactual_grid_search', {}).get('best', {}).get('score_metrics', {}).get('top3_hit_rate'):.1%}" if summary.get('counterfactual_grid_search', {}).get('best', {}).get('score_metrics', {}).get('top3_hit_rate') is not None else "- 反事实参数搜索最佳 Top3：暂无",
         f"- 低估总进球：{summary['score_metrics'].get('underestimated_total_goals_rate', 0.0):.1%}",
         f"- 高估总进球：{summary['score_metrics'].get('overestimated_total_goals_rate', 0.0):.1%}",
         f"- 低估平局：{summary['score_metrics'].get('underestimated_draw_rate', 0.0):.1%}",
@@ -1356,8 +1892,9 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
         predicted = row.get("model_top_outcome") or "未知"
         diagnosis_text = diagnosis_label_text(row.get("score_diagnosis"))
         mistake_text = mistake_tag_text(row.get("mistake_tags"))
+        source_label = "[代理回放] " if row.get("review_source") == "full_playback_proxy" else "[真实快照] "
         lines.append(
-            f"- {row['match_time']} {row['home']} vs {row['away']}：实际 {row['actual_score']}（{row['actual_outcome']}），"
+            f"- {source_label}{row['match_time']} {row['home']} vs {row['away']}：实际 {row['actual_score']}（{row['actual_outcome']}），"
             f"模型主方向 {predicted}，AI前主方向 {row.get('base_model_top_outcome') or '未知'}，真实方向概率 {model_probs[int(row['actual_outcome_idx'])]:.1%}，"
             f"比分 Top3 命中：{'是' if row['top3_hit'] else '否'}；比分诊断：{diagnosis_text}；赛果错因：{mistake_text}。"
         )
@@ -1371,7 +1908,7 @@ def write_reflection_report(summary: Dict[str, object]) -> Path:
             f"- 战术修正调优：{summary.get('calibration_tactical_decision', 'keep_current_tactical_delta')}；当前战术权重 {summary['risk_config'].get('tactical_adjustment_weight', 1.0):.2f}，战术修正上限 {summary['risk_config'].get('tactical_adjustment_max_delta', 0.02):.3f}。",
             f"- 价值修正调优：{summary.get('calibration_value_decision', 'keep_current_value_delta')}；当前价值权重 {summary['risk_config'].get('value_adjustment_weight', 1.0):.2f}，价值修正上限 {summary['risk_config'].get('value_adjustment_max_delta', 0.025):.3f}。",
             f"- 天气修正调优：{summary.get('calibration_weather_decision', 'keep_current_weather_delta')}；当前天气权重 {summary['risk_config'].get('weather_adjustment_weight', 1.0):.2f}，天气修正上限 {summary['risk_config'].get('weather_adjustment_max_delta', 0.02):.3f}。",
-            f"- 本轮样本只有 {summary['reviewed_matches']} 场，不调整模型/市场融合权重；只做短期风控收紧。",
+            f"- 本轮直接匹配快照只有 {summary.get('matched_snapshot_matches', summary['reviewed_matches'])} 场；若含全量回放代理则覆盖 {summary['reviewed_matches']} 场，不调整模型/市场融合权重；只做短期风控收紧。",
             f"- 已将 Kelly 从 1/4 降到不高于 1/5，并将最小 EV 门槛提高到 7%；总投入上限保留为 {summary['risk_config']['max_total_stake']:.0f} 元。",
             "",
             "## 4. 下一步",
@@ -1390,19 +1927,40 @@ def main() -> int:
     predictions = load_snapshot_predictions()
     results = load_results()
     full_playback = build_full_playback_samples(results)
+    full_playback_index = {
+        (str(row.get("match_time", "")), str(row.get("home", "")), str(row.get("away", ""))): row
+        for row in full_playback
+        if row.get("match_time") and row.get("home") and row.get("away")
+    }
     training_candidate_index = load_training_candidate_index()
     prematch_news_index = load_combined_prematch_news_index()
     calibration_config = load_probability_config()
+    probability_model = load_probability_model(ROOT / "config" / "model_probabilities.json")
+    strengths = infer_team_strengths(probability_model)
+    score_model = load_score_model(SCORE_MODEL_PATH)
+    risk_config = load_risk_config(CALIBRATION_PATH)
     reviewed = []
+    matched_snapshot_count = 0
+    playback_proxy_count = 0
+    counterfactual_replay = []
+    counterfactual_inputs: List[Dict[str, object]] = []
     exact_hits = 0
     top3_hits = 0
     top5_hits = 0
+    counterfactual_exact_hits = 0
+    counterfactual_top3_hits = 0
+    counterfactual_top5_hits = 0
 
     for actual in results:
         key = (str(actual.get("match_time", "")), str(actual.get("home_team", "")), str(actual.get("away_team", "")))
         prediction_row = predictions.get(key)
         if not prediction_row:
+            playback_row = full_playback_index.get(key)
+            if playback_row:
+                reviewed.append(playback_review_row(actual, playback_row))
+                playback_proxy_count += 1
             continue
+        matched_snapshot_count += 1
         prediction_row = rebuild_adjustment_fields(prediction_row, training_candidate_index, prematch_news_index, calibration_config)
         actual_home = int(actual.get("home_goals", 0))
         actual_away = int(actual.get("away_goals", 0))
@@ -1422,8 +1980,24 @@ def main() -> int:
         value_probs = normalize_probs(prediction_row.get("value_adjusted_probabilities"))
         market_probs = normalize_probs(prediction_row.get("market_probabilities")) or market_probs_from_odds(prediction_row.get("normal_odds"))
         fused_probs = normalize_probs(prediction_row.get("fused_probabilities")) or model_probs
+        counterfactual_inputs.append(
+            {
+                "prediction_row": prediction_row,
+                "actual_home": actual_home,
+                "actual_away": actual_away,
+                "model_probs": model_probs,
+            }
+        )
         diagnosis = score_diagnosis(prediction, actual_home, actual_away, model_probs)
+        funnel_diagnosis = top5_to_top3_diagnosis(prediction, actual_home, actual_away)
         market_score_diagnosis = score_market_direction_diagnosis(prediction_row, actual_home, actual_away)
+        counterfactual_prediction = rebuild_counterfactual_score_prediction(prediction_row, score_model, strengths, prematch_news_index, risk_config)
+        counterfactual_row = counterfactual_score_row(prediction_row, actual_home, actual_away, model_probs, counterfactual_prediction)
+        if counterfactual_row:
+            counterfactual_exact_hits += 1 if counterfactual_row.get("exact_hit") else 0
+            counterfactual_top3_hits += 1 if counterfactual_row.get("top3_hit") else 0
+            counterfactual_top5_hits += 1 if counterfactual_row.get("top5_hit") else 0
+            counterfactual_replay.append(counterfactual_row)
         ai_adjustment = prediction_row.get("ai_adjustment") or {}
         mistake_tags = outcome_mistake_tags(
             outcome_idx,
@@ -1468,9 +2042,16 @@ def main() -> int:
                 "top3_hit": top3,
                 "top5_hit": top5,
                 **market_score_diagnosis,
+                **funnel_diagnosis,
                 **diagnosis,
             }
         )
+
+    snapshot_reviewed = [row for row in reviewed if row.get("review_source") != "full_playback_proxy"]
+    playback_proxy_reviewed = [row for row in reviewed if row.get("review_source") == "full_playback_proxy"]
+    snapshot_bucket = review_bucket(snapshot_reviewed)
+    playback_proxy_bucket = review_bucket(playback_proxy_reviewed)
+    combined_bucket = review_bucket(reviewed)
 
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = REVIEW_DOCS_DIR / f"postmatch-calibration_{timestamp}.json"
@@ -1479,17 +2060,18 @@ def main() -> int:
         "snapshots_scanned": len(snapshot_files()),
         "results_loaded": len(results),
         "reviewed_matches": len(reviewed),
-        "score_metrics": score_metric_summary(reviewed, exact_hits, top3_hits, top5_hits),
-        "probability_metrics": {
-            "base": probability_stats(reviewed, "base_model_probabilities"),
-            "context": probability_stats(reviewed, "context_adjusted_probabilities"),
-            "weather": probability_stats(reviewed, "weather_adjusted_probabilities"),
-            "tactical": probability_stats(reviewed, "tactical_adjusted_probabilities"),
-            "value": probability_stats(reviewed, "value_adjusted_probabilities"),
-            "model": probability_stats(reviewed, "model_probabilities"),
-            "market": probability_stats(reviewed, "market_probabilities"),
-            "fused": probability_stats(reviewed, "fused_probabilities"),
+        "matched_snapshot_matches": matched_snapshot_count,
+        "playback_proxy_matches": playback_proxy_count,
+        "snapshot_metrics": snapshot_bucket,
+        "playback_proxy_metrics": playback_proxy_bucket,
+        "combined_metrics": combined_bucket,
+        "score_metrics": combined_bucket["score_metrics"],
+        "counterfactual_replay": {
+            "sample_size": len(counterfactual_replay),
+            "score_metrics": score_metric_summary(counterfactual_replay, counterfactual_exact_hits, counterfactual_top3_hits, counterfactual_top5_hits),
+            "matches": counterfactual_replay,
         },
+        "probability_metrics": combined_bucket["probability_metrics"],
         "full_playback": {
             "sample_size": len(full_playback),
             "score_metrics": score_metric_summary(
@@ -1506,10 +2088,20 @@ def main() -> int:
         "matches": reviewed,
         "review_file": out_path.name,
     }
-    summary["mistake_tag_metrics"] = mistake_tag_summary(reviewed)
-    summary["adjustment_module_metrics"] = adjustment_module_metrics(reviewed)
-    summary["odds_movement_metrics"] = odds_movement_summary(reviewed)
-    summary["odds_outcome_cross_metrics"] = odds_outcome_cross_metrics(reviewed)
+    summary["counterfactual_grid_search"] = counterfactual_grid_search(
+        counterfactual_inputs,
+        score_model,
+        strengths,
+        prematch_news_index,
+        risk_config,
+    )
+    summary["counterfactual_replay"]["score_metric_delta_vs_snapshot"] = score_metric_delta(
+        summary["snapshot_metrics"]["score_metrics"], summary["counterfactual_replay"]["score_metrics"]
+    )
+    summary["mistake_tag_metrics"] = combined_bucket["mistake_tag_metrics"]
+    summary["adjustment_module_metrics"] = snapshot_bucket["adjustment_module_metrics"]
+    summary["odds_movement_metrics"] = snapshot_bucket["odds_movement_metrics"]
+    summary["odds_outcome_cross_metrics"] = snapshot_bucket["odds_outcome_cross_metrics"]
     summary["advice"] = build_advice(summary, reviewed)
 
     REVIEW_DOCS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1519,10 +2111,22 @@ def main() -> int:
     print(f"Snapshots scanned: {summary['snapshots_scanned']}")
     print(f"Results loaded: {summary['results_loaded']}")
     print(f"Reviewed matches: {summary['reviewed_matches']}")
+    print(f"Matched snapshots: {summary['matched_snapshot_matches']}")
+    print(f"Playback proxy matches: {summary['playback_proxy_matches']}")
+    print(f"Snapshot WDL accuracy: {summary['snapshot_metrics']['probability_metrics']['model']['accuracy']}")
+    print(f"Playback proxy WDL accuracy: {summary['playback_proxy_metrics']['probability_metrics']['model']['accuracy']}")
+    print(f"Combined WDL accuracy: {summary['combined_metrics']['probability_metrics']['model']['accuracy']}")
     print(f"Full playback matches: {summary['full_playback']['sample_size']}")
     print(f"Exact score accuracy: {summary['score_metrics']['exact_score_accuracy']:.4f}")
     print(f"Top3 hit rate: {summary['score_metrics']['top3_hit_rate']:.4f}")
     print(f"Top5 hit rate: {summary['score_metrics']['top5_hit_rate']:.4f}")
+    print(f"Counterfactual replay matches: {summary['counterfactual_replay']['sample_size']}")
+    print(f"Counterfactual Top3 hit rate: {summary['counterfactual_replay']['score_metrics']['top3_hit_rate']:.4f}")
+    print(f"Counterfactual Top5 hit rate: {summary['counterfactual_replay']['score_metrics']['top5_hit_rate']:.4f}")
+    best_grid = summary.get("counterfactual_grid_search", {}).get("best") if isinstance(summary.get("counterfactual_grid_search"), dict) else None
+    if isinstance(best_grid, dict):
+        print(f"Counterfactual grid best score: {best_grid.get('score_value'):.4f}")
+        print(f"Counterfactual grid best params: {best_grid.get('params')}")
     print(f"Model WDL accuracy: {summary['probability_metrics']['model']['accuracy']}")
     print(f"Review written: {out_path}")
     print(f"Reflection written: {reflection_path}")
